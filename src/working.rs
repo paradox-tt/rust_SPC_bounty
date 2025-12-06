@@ -1,55 +1,69 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Months, TimeZone, Utc};
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
-use parity_scale_codec::Encode;
 use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 use sp_core::{ed25519, sr25519, H256};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use subxt::{OnlineClient, PolkadotConfig};
 use tokio::sync::Mutex;
-use std::str::FromStr;
 
-
-// ====== Subxt metadata (must match endpoint) ======
-#[subxt::subxt(runtime_metadata_path = "metadata/kusama-people.scale")]
-pub mod people {}
-
+// ====== Subxt metadata modules (one per chain) ======
 #[subxt::subxt(runtime_metadata_path = "metadata/asset-hub-polkadot.scale")]
-pub mod ahp {}
+pub mod ahp_polkadot {}
+#[subxt::subxt(runtime_metadata_path = "metadata/bridge-hub-polkadot.scale")]
+pub mod bridgehub_polkadot {}
+#[subxt::subxt(runtime_metadata_path = "metadata/coretime-polkadot.scale")]
+pub mod coretime_polkadot {}
+#[subxt::subxt(runtime_metadata_path = "metadata/collectives-polkadot.scale")]
+pub mod collectives_polkadot {}
+#[subxt::subxt(runtime_metadata_path = "metadata/people-polkadot.scale")]
+pub mod people_polkadot {}
 
-// ---------------- config ----------------
+#[subxt::subxt(runtime_metadata_path = "metadata/asset-hub-kusama.scale")]
+pub mod ahp_kusama {}
+#[subxt::subxt(runtime_metadata_path = "metadata/bridge-hub-kusama.scale")]
+pub mod bridgehub_kusama {}
+#[subxt::subxt(runtime_metadata_path = "metadata/coretime-kusama.scale")]
+pub mod coretime_kusama {}
+#[subxt::subxt(runtime_metadata_path = "metadata/people-kusama.scale")]
+pub mod people_kusama {}
+#[subxt::subxt(runtime_metadata_path = "metadata/encointer-kusama.scale")]
+pub mod encointer_kusama {}
+
+// ---------------- requested chains ----------------
 #[derive(Clone, Copy, Debug)]
-enum Chain { People, Ahp }
-
-impl Chain {
-    fn ws(self) -> &'static str {
-        match self {
-            Chain::People => "wss://rpc-people-kusama.luckyfriday.io",
-            Chain::Ahp    => "wss://rpc-asset-hub-polkadot.luckyfriday.io",
-        }
-    }
-    fn ss58_prefix(self) -> u16 {
-        match self {
-            Chain::People => 2, // Kusama
-            Chain::Ahp    => 0, // Polkadot
-        }
-    }
-    fn name(self) -> &'static str {
-        match self {
-            Chain::People => "Kusama People",
-            Chain::Ahp    => "Asset Hub Polkadot",
-        }
-    }
+struct ChainCfg {
+    name: &'static str,
+    ws:   &'static str,
+    ss58: u16,       // network prefix for AccountId SS58 (0 for DOT, 2 for KSM)
+    // true = aura session key is sr25519; false = ed25519 (used only for pretty-printing the session key)
+    session_is_sr25519: bool,
 }
 
-// knobs
+const CHAINS: &[ChainCfg] = &[
+    // Polkadot
+    ChainCfg { name: "Polkadot Asset Hub",   ws: "wss://rpc-asset-hub-polkadot.luckyfriday.io",  ss58: 0, session_is_sr25519: false },
+    ChainCfg { name: "Polkadot Bridge Hub",  ws: "wss://rpc-bridge-hub-polkadot.luckyfriday.io", ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot Coretime",    ws: "wss://rpc-coretime-polkadot.luckyfriday.io",   ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot Collectives", ws: "wss://rpc-collectives-polkadot.luckyfriday.io",ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot People",      ws: "wss://rpc-people-polkadot.luckyfriday.io",     ss58: 0, session_is_sr25519: true  },
+    // Kusama
+    ChainCfg { name: "Kusama Asset Hub",     ws: "wss://rpc-asset-hub-kusama.luckyfriday.io",    ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Bridge Hub",    ws: "wss://rpc-bridge-hub-kusama.luckyfriday.io",   ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Coretime",      ws: "wss://rpc-coretime-kusama.luckyfriday.io",     ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama People",        ws: "wss://rpc-people-kusama.luckyfriday.io",       ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Encointer",     ws: "wss://rpc-encointer-kusama.luckyfriday.io",    ss58: 2, session_is_sr25519: true  },
+];
+
+// ---------------- knobs ----------------
 const REWARD_USD: f64 = 300.0;
 const CHUNK_SIZE: usize = 10_000;
 const CONCURRENCY: usize = 32;
@@ -60,9 +74,6 @@ const CALL_TIMEOUT_SECS: u64 = 20;
 #[tokio::main]
 async fn main() -> Result<()> {
     let chain = prompt_chain()?;
-    let cfg_ws = chain.ws();
-    let ss58_prefix = chain.ss58_prefix();
-
     let Inputs { month, year, ema, fiat_opt } = prompt_inputs()?;
 
     // compute window (capped at now)
@@ -79,29 +90,25 @@ async fn main() -> Result<()> {
 
     println!(
         "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}{}",
-        chain.name(),
-        cfg_ws,
-        start_dt.to_rfc3339(),
-        end_dt.to_rfc3339(),
-        ema,
-        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f / ema)).unwrap_or_default()
+        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema,
+        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f/ema)).unwrap_or_default()
     );
 
     // connections
-    let api = OnlineClient::<PolkadotConfig>::from_insecure_url(cfg_ws)
+    let api = OnlineClient::<PolkadotConfig>::from_insecure_url(chain.ws)
         .await
-        .with_context(|| format!("connect subxt to {}", cfg_ws))?;
+        .with_context(|| format!("connect subxt to {}", chain.ws))?;
     let rpc = Arc::new(
         WsClientBuilder::default()
-            .build(cfg_ws)
+            .build(chain.ws)
             .await
-            .with_context(|| format!("connect rpc ws to {}", cfg_ws))?,
+            .with_context(|| format!("connect rpc ws to {}", chain.ws))?,
     );
 
     // latest
     let latest = api.blocks().at_latest().await?;
     let latest_num = latest.number();
-    let latest_ts = block_timestamp(&api, latest.hash(), chain).await?.unwrap_or(0);
+    let latest_ts = block_timestamp_typed(&api, latest.hash(), chain).await?.unwrap_or(0);
     println!("==> Latest: #{} ts={}", latest_num, fmt_ts(latest_ts));
     if latest_ts < start_ms {
         bail!("Latest {} is before window start {}.", fmt_ts(latest_ts), fmt_ts(start_ms));
@@ -169,6 +176,7 @@ async fn main() -> Result<()> {
                 let unknowns = unknowns.clone();
                 let block_errors = block_errors.clone();
                 let owner_to_session = owner_to_session.clone();
+                let chain = chain;
 
                 async move {
                     let numbers: Vec<u32> = (c_start..=c_end).collect();
@@ -182,17 +190,18 @@ async fn main() -> Result<()> {
                         let unknowns = unknowns.clone();
                         let block_errors = block_errors.clone();
                         let owner_to_session = owner_to_session.clone();
+                        let chain = chain;
 
                         async move {
                             let res: Result<()> = async {
                                 let h = block_hash_by_number(&rpc, n).await?;
 
-                                // 1) derive aura session key (slot % authorities)
-                                let session_key_opt: Option<[u8; 32]> = derive_session_key(&api, h, chain).await?;
+                                // 1) derive aura session key (slot % authorities) via typed storage
+                                let session_key_opt = derive_session_key_typed(&api, h, chain).await?;
 
-                                // 2) resolve owner via session.key_owner((KeyTypeId("aura"), key_bytes))
+                                // 2) resolve owner via Session::KeyOwner((KeyTypeId("aura"), key_bytes))
                                 if let Some(sess_key) = session_key_opt {
-                                    if let Some(owner_raw) = session_key_owner_account(&api, h, chain, sess_key).await? {
+                                    if let Some(owner_raw) = session_key_owner_account_typed(&api, h, chain, sess_key).await? {
                                         // tally
                                         {
                                             let mut sm = stats.lock().await;
@@ -266,81 +275,52 @@ async fn main() -> Result<()> {
 
     // summary
     let stats = Arc::try_unwrap(stats).unwrap().into_inner();
-    let session_map = Arc::try_unwrap(owner_to_session).unwrap().into_inner();
     let total_scanned: usize = stats.values().copied().sum();
 
-    // rows: (owner_ss58, count, %total, session_key_hex, owner_hex)
-    let mut rows: Vec<(String, usize, f64, String, String)> = stats
+    let mut rows: Vec<(String, usize, f64)> = stats
         .into_iter()
         .map(|(owner_raw, cnt)| {
-            if owner_raw == [0u8; 32] {
-                let pct_total = if total_scanned > 0 {
-                    (cnt as f64) * 100.0 / (total_scanned as f64)
-                } else { 0.0 };
-                (
-                    "UNKNOWN".to_string(),
-                    cnt,
-                    pct_total,
-                    "0x".to_string() + &hex::encode([0u8;32]),
-                    "0x".to_string() + &hex::encode([0u8;32]),
-                )
+            let label = if owner_raw == [0u8; 32] {
+                "UNKNOWN".to_string()
             } else {
-                let ss58 = ss58_from_raw32_with_prefix(owner_raw, ss58_prefix, chain);
-                let owner_hex = format!("0x{}", hex::encode(owner_raw));
-                let sess_hex = session_map
-                    .get(&owner_raw)
-                    .map(|s| format!("0x{}", hex::encode(s)))
-                    .unwrap_or_else(|| "-".to_string());
-
-                let pct_total = if total_scanned > 0 { (cnt as f64) * 100.0 / (total_scanned as f64) } else { 0.0 };
-                (ss58, cnt, pct_total, sess_hex, owner_hex)
-            }
+                ss58_from_raw32_with_prefix(owner_raw, chain.ss58)
+            };
+            let pct_total = if total_scanned > 0 {
+                (cnt as f64) * 100.0 / (total_scanned as f64)
+            } else { 0.0 };
+            (label, cnt, pct_total)
         })
         .collect();
 
     rows.sort_by(|a, b| {
-        if a.0 == "UNKNOWN" && b.0 != "UNKNOWN" {
-            std::cmp::Ordering::Greater
-        } else if b.0 == "UNKNOWN" && a.0 != "UNKNOWN" {
-            std::cmp::Ordering::Less
-        } else {
-            b.1.cmp(&a.1)
-        }
+        if a.0 == "UNKNOWN" && b.0 != "UNKNOWN" { std::cmp::Ordering::Greater }
+        else if b.0 == "UNKNOWN" && a.0 != "UNKNOWN" { std::cmp::Ordering::Less }
+        else { b.1.cmp(&a.1) }
     });
 
-    let max_count = rows.iter().map(|(_, c, _, _, _)| *c).max().unwrap_or(0);
+    let max_count = rows.iter().map(|(_, c, _)| *c).max().unwrap_or(0);
 
     println!("\n================ SUMMARY (full scan) ================");
-    println!("Chain:      {}", chain.name());
-    println!("Chain RPC:  {}", cfg_ws);
+    println!("Chain:      {}", chain.name);
+    println!("Chain RPC:  {}", chain.ws);
     println!("Window:     [{} .. {})", start_dt.to_rfc3339(), end_dt.to_rfc3339());
     println!("Blocks scanned: {}", total_scanned);
-    println!(
-        "{:<6}  {:<58}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}2\
-        ",
-        "Rank", "Author (Owner SS58)", "Blocks", "%", "%Top", "Payout", "Payout/EMA"
-    );
-    println!("{}", "-".repeat(220));
+    println!("{:<6}  {:<58}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}",
+             "Rank","Author (Owner SS58)","Blocks","%","%Top","Payout","Payout/EMA");
+    println!("{}", "-".repeat(120));
 
-    for (i, (author, cnt, pct_total, sess_hex, acc_hex)) in rows.iter().enumerate() {
+    for (i, (author, cnt, pct_total)) in rows.iter().enumerate() {
         let pct_top = if max_count > 0 { (*cnt as f64) * 100.0 / (max_count as f64) } else { 0.0 };
         let payout = REWARD_USD * (pct_top / 100.0);
         let payout_per_ema = payout / ema;
 
-        println!(
-            "{:<6}  {:<58}  {:>8}  {:>7.2}  {:>7.2}  {:>9.2}  {:>11.6}",
-            i + 1, author, cnt, pct_total, pct_top, payout, payout_per_ema
-        );
+        println!("{:<6}  {:<58}  {:>8}  {:>7.2}  {:>7.2}  {:>9.2}  {:>11.6}",
+                 i + 1, author, cnt, pct_total, pct_top, payout, payout_per_ema);
     }
-    println!("{}", "-".repeat(220));
+    println!("{}", "-".repeat(120));
     println!("Note: '%' is share of all blocks in window; '%Top' is relative to the top producer.");
     println!("Assumed reward pool for '%Top' payout: ${:.2}", REWARD_USD);
     println!("EMA used: {}", ema);
-
-    // diagnostics
-    let unknowns = Arc::try_unwrap(unknowns).unwrap().into_inner();
-    let block_errors = Arc::try_unwrap(block_errors).unwrap().into_inner();
-    eprintln!("Diagnostics: unknown-authors={}, block-errors={}", unknowns, block_errors);
 
     println!("==> Done.");
     Ok(())
@@ -349,19 +329,35 @@ async fn main() -> Result<()> {
 // ---------------- interactive ----------------
 struct Inputs { month: u8, year: i32, ema: f64, fiat_opt: Option<f64> }
 
-fn prompt_chain() -> Result<Chain> {
+fn prompt_chain() -> Result<ChainCfg> {
     loop {
         println!("Select chain:");
-        println!("  1) Kusama People");
-        println!("  2) Asset Hub Polkadot");
-        print!("Enter selection (1 or 2): ");
+        println!("  1) Polkadot  Asset Hub");
+        println!("  2) Polkadot  Bridge Hub");
+        println!("  3) Polkadot  Coretime");
+        println!("  4) Polkadot  Collectives");
+        println!("  5) Polkadot  People");
+        println!("  6) Kusama    Asset Hub");
+        println!("  7) Kusama    Bridge Hub");
+        println!("  8) Kusama    Coretime");
+        println!("  9) Kusama    People");
+        println!(" 10) Kusama    Encointer");
+        print!("Enter selection (1-10): ");
         io::stdout().flush().ok();
         let mut s = String::new();
         io::stdin().read_line(&mut s)?;
         match s.trim() {
-            "1" => return Ok(Chain::People),
-            "2" => return Ok(Chain::Ahp),
-            _ => { eprintln!("  -> Please enter 1 or 2."); }
+            "1" => return Ok(CHAINS[0]),
+            "2" => return Ok(CHAINS[1]),
+            "3" => return Ok(CHAINS[2]),
+            "4" => return Ok(CHAINS[3]),
+            "5" => return Ok(CHAINS[4]),
+            "6" => return Ok(CHAINS[5]),
+            "7" => return Ok(CHAINS[6]),
+            "8" => return Ok(CHAINS[7]),
+            "9" => return Ok(CHAINS[8]),
+            "10" => return Ok(CHAINS[9]),
+            _ => eprintln!("  -> Please enter 1..10."),
         }
     }
 }
@@ -412,33 +408,35 @@ fn prompt_inputs() -> Result<Inputs> {
     Ok(Inputs { month, year, ema, fiat_opt })
 }
 
-// ---------------- helpers ----------------
+// ---------------- typed storage helpers ----------------
 
 async fn block_hash_by_number(rpc: &Arc<jsonrpsee::ws_client::WsClient>, number: u32) -> Result<H256> {
-    // Using jsonrpsee for speed
     let hex: String = tokio::time::timeout(
         Duration::from_secs(CALL_TIMEOUT_SECS),
         rpc.request("chain_getBlockHash", rpc_params![number]),
     )
         .await
-        .map_err(|_| anyhow::anyhow!("timeout chain_getBlockHash({number})"))??;
+        .map_err(|_| anyhow!("timeout chain_getBlockHash({number})"))??;
 
-    // H256 hex from node is already 0x-prefixed; sp_core::H256 FromStr handles it
-    let h = H256::from_str(hex.trim()).map_err(|e| anyhow::anyhow!("bad hash from rpc for #{number}: {e}"))?;
+    let h = H256::from_str(hex.trim()).map_err(|e| anyhow!("bad hash from rpc for #{number}: {e}"))?;
     Ok(h)
 }
 
-async fn block_timestamp(api: &OnlineClient<PolkadotConfig>, at: H256, chain: Chain) -> Result<Option<u64>> {
-    match chain {
-        Chain::People => {
-            let ts: Option<u64> = api.storage().at(at).fetch(&people::storage().timestamp().now()).await?;
-            Ok(ts)
-        }
-        Chain::Ahp => {
-            let ts: Option<u64> = api.storage().at(at).fetch(&ahp::storage().timestamp().now()).await?;
-            Ok(ts)
-        }
-    }
+async fn block_timestamp_typed(api: &OnlineClient<PolkadotConfig>, at: H256, chain: ChainCfg) -> Result<Option<u64>> {
+    // Pallet Timestamp::now is consistent on these chains; use the correct module per chain.
+    Ok(match chain.name {
+        "Polkadot Asset Hub"   => api.storage().at(at).fetch(&ahp_polkadot::storage().timestamp().now()).await?,
+        "Polkadot Bridge Hub"  => api.storage().at(at).fetch(&bridgehub_polkadot::storage().timestamp().now()).await?,
+        "Polkadot Coretime"    => api.storage().at(at).fetch(&coretime_polkadot::storage().timestamp().now()).await?,
+        "Polkadot Collectives" => api.storage().at(at).fetch(&collectives_polkadot::storage().timestamp().now()).await?,
+        "Polkadot People"      => api.storage().at(at).fetch(&people_polkadot::storage().timestamp().now()).await?,
+        "Kusama Asset Hub"     => api.storage().at(at).fetch(&ahp_kusama::storage().timestamp().now()).await?,
+        "Kusama Bridge Hub"    => api.storage().at(at).fetch(&bridgehub_kusama::storage().timestamp().now()).await?,
+        "Kusama Coretime"      => api.storage().at(at).fetch(&coretime_kusama::storage().timestamp().now()).await?,
+        "Kusama People"        => api.storage().at(at).fetch(&people_kusama::storage().timestamp().now()).await?,
+        "Kusama Encointer"     => api.storage().at(at).fetch(&encointer_kusama::storage().timestamp().now()).await?,
+        _ => None,
+    })
 }
 
 async fn bin_search_first_ge(
@@ -447,10 +445,10 @@ async fn bin_search_first_ge(
     mut lo: u32,
     mut hi: u32,
     target_ms: u64,
-    chain: Chain,
+    chain: ChainCfg,
 ) -> Result<u32> {
-    let lo_ts = block_timestamp(api, block_hash_by_number(rpc, lo).await?, chain).await?.unwrap_or(0);
-    let hi_ts = block_timestamp(api, block_hash_by_number(rpc, hi).await?, chain).await?.unwrap_or(0);
+    let lo_ts = block_timestamp_typed(api, block_hash_by_number(rpc, lo).await?, chain).await?.unwrap_or(0);
+    let hi_ts = block_timestamp_typed(api, block_hash_by_number(rpc, hi).await?, chain).await?.unwrap_or(0);
 
     if hi_ts < target_ms {
         bail!("bin_search_first_ge: hi(#{} ts={}) < target {}", hi, fmt_ts(hi_ts), fmt_ts(target_ms));
@@ -460,7 +458,7 @@ async fn bin_search_first_ge(
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
         let mid_h = block_hash_by_number(rpc, mid).await?;
-        let mid_ts = block_timestamp(api, mid_h, chain).await?.unwrap_or(0);
+        let mid_ts = block_timestamp_typed(api, mid_h, chain).await?.unwrap_or(0);
         if mid_ts >= target_ms { hi = mid; } else { lo = mid; }
     }
     Ok(hi)
@@ -474,94 +472,217 @@ fn fmt_ts(ts_ms: u64) -> String {
     }
 }
 
-fn ss58_from_raw32_with_prefix(raw: [u8; 32], prefix: u16, chain: Chain) -> String {
+fn ss58_from_raw32_with_prefix(raw: [u8; 32], prefix: u16) -> String {
     let fmt = Ss58AddressFormat::custom(prefix);
-    // AccountId SS58 doesn’t depend on ed/sr; either type encodes the same 32B.
-    match chain {
-        Chain::Ahp => ed25519::Public::from_raw(raw).to_ss58check_with_version(fmt),
-        Chain::People => sr25519::Public::from_raw(raw).to_ss58check_with_version(fmt),
-    }
+    // AccountId32 SS58 is agnostic to ed/sr; use sr for formatting convenience.
+    sr25519::Public::from_raw(raw).to_ss58check_with_version(fmt)
 }
 
-// ---- author resolution pieces ----
+// ---- author resolution with TYPED metadata ----
 
-async fn derive_session_key(
+async fn derive_session_key_typed(
     api: &OnlineClient<PolkadotConfig>,
     at: H256,
-    chain: Chain,
+    chain: ChainCfg,
 ) -> Result<Option<[u8; 32]>> {
-    match chain {
-        // People uses Aura sr25519
-        Chain::People => {
-            let slot: Option<people::runtime_types::sp_consensus_slots::Slot> =
-                api.storage().at(at).fetch(&people::storage().aura().current_slot()).await?;
-            let auths: Option<
-                people::runtime_types::bounded_collections::bounded_vec::BoundedVec<
-                    people::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
-                >
-            > = api.storage().at(at).fetch(&people::storage().aura().authorities()).await?;
-
-            let slot_num_opt = slot.as_ref().map(|s| s.0);
-            let alen = auths.as_ref().map(|b| b.0.len()).unwrap_or(0);
-
-            if let (Some(slot_num), Some(bv)) = (slot_num_opt, auths.as_ref()) {
-                if alen == 0 { return Ok(None); }
-                let idx = (slot_num as usize) % alen;
-                Ok(Some(bv.0[idx].0))
-            } else {
-                Ok(None)
-            }
-        }
-        // AHP uses Aura ed25519
-        Chain::Ahp => {
-            let slot: Option<ahp::runtime_types::sp_consensus_slots::Slot> =
-                api.storage().at(at).fetch(&ahp::storage().aura().current_slot()).await?;
-            let auths: Option<
-                ahp::runtime_types::bounded_collections::bounded_vec::BoundedVec<
-                    ahp::runtime_types::sp_consensus_aura::ed25519::app_ed25519::Public
-                >
-            > = api.storage().at(at).fetch(&ahp::storage().aura().authorities()).await?;
-
-            let slot_num_opt = slot.as_ref().map(|s| s.0);
-            let alen = auths.as_ref().map(|b| b.0.len()).unwrap_or(0);
-
-            if let (Some(slot_num), Some(bv)) = (slot_num_opt, auths.as_ref()) {
-                if alen == 0 { return Ok(None); }
-                let idx = (slot_num as usize) % alen;
-                Ok(Some(bv.0[idx].0))
-            } else {
-                Ok(None)
-            }
-        }
+    // Match the right module and types per chain.
+    macro_rules! pick_key {
+        ($slot_opt:expr, $auths_opt:expr) => {{
+            let slot_opt = $slot_opt;
+            let auths_opt = $auths_opt;
+            if let (Some(slot), Some(bv)) = (slot_opt, auths_opt) {
+                let v = bv.0; // bounded_vec inner Vec<app_*::Public>
+                if v.is_empty() { None } else {
+                    let idx = (slot.0 as usize) % v.len();
+                    Some(v[idx].0)
+                }
+            } else { None }
+        }};
     }
+
+    let key_opt = match chain.name {
+        // Polkadot
+        "Polkadot Asset Hub" => {
+            let slot: Option<ahp_polkadot::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&ahp_polkadot::storage().aura().current_slot()).await?;
+            let auths: Option<
+                ahp_polkadot::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    ahp_polkadot::runtime_types::sp_consensus_aura::ed25519::app_ed25519::Public
+                >
+            > = api.storage().at(at).fetch(&ahp_polkadot::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Polkadot Bridge Hub" => {
+            let slot: Option<bridgehub_polkadot::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&bridgehub_polkadot::storage().aura().current_slot()).await?;
+            let auths: Option<
+                bridgehub_polkadot::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    bridgehub_polkadot::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&bridgehub_polkadot::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Polkadot Coretime" => {
+            let slot: Option<coretime_polkadot::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&coretime_polkadot::storage().aura().current_slot()).await?;
+            let auths: Option<
+                coretime_polkadot::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    coretime_polkadot::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&coretime_polkadot::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Polkadot Collectives" => {
+            let slot: Option<collectives_polkadot::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&collectives_polkadot::storage().aura().current_slot()).await?;
+            let auths: Option<
+                collectives_polkadot::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    collectives_polkadot::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&collectives_polkadot::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Polkadot People" => {
+            let slot: Option<people_polkadot::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&people_polkadot::storage().aura().current_slot()).await?;
+            let auths: Option<
+                people_polkadot::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    people_polkadot::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&people_polkadot::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        // Kusama
+        "Kusama Asset Hub" => {
+            let slot: Option<ahp_kusama::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&ahp_kusama::storage().aura().current_slot()).await?;
+            let auths: Option<
+                ahp_kusama::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    ahp_kusama::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&ahp_kusama::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Kusama Bridge Hub" => {
+            let slot: Option<bridgehub_kusama::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&bridgehub_kusama::storage().aura().current_slot()).await?;
+            let auths: Option<
+                bridgehub_kusama::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    bridgehub_kusama::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&bridgehub_kusama::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Kusama Coretime" => {
+            let slot: Option<coretime_kusama::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&coretime_kusama::storage().aura().current_slot()).await?;
+            let auths: Option<
+                coretime_kusama::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    coretime_kusama::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&coretime_kusama::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Kusama People" => {
+            let slot: Option<people_kusama::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&people_kusama::storage().aura().current_slot()).await?;
+            let auths: Option<
+                people_kusama::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    people_kusama::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&people_kusama::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        "Kusama Encointer" => {
+            let slot: Option<encointer_kusama::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&encointer_kusama::storage().aura().current_slot()).await?;
+            let auths: Option<
+                encointer_kusama::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    encointer_kusama::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&encointer_kusama::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
+        _ => None,
+    };
+
+    Ok(key_opt)
 }
 
-async fn session_key_owner_account(
+async fn session_key_owner_account_typed(
     api: &OnlineClient<PolkadotConfig>,
     at: H256,
-    chain: Chain,
+    chain: ChainCfg,
     session_key_raw32: [u8; 32],
 ) -> Result<Option<[u8; 32]>> {
-    // Build tuple (KeyTypeId("aura"), Bytes(session_key))
-    match chain {
-        Chain::People => {
-            // NOTE: Depending on metadata version, KeyTypeId path may differ slightly.
-            let kt = people::runtime_types::sp_core::crypto::KeyTypeId(*b"aura");
-            let call = people::storage().session().key_owner((kt, session_key_raw32.to_vec()));
-            let owner_opt = api.storage().at(at).fetch(&call).await?;
+    let aura = *b"aura";
+
+    macro_rules! fetch_owner {
+        ($call:expr) => {{
+            let owner_opt = api.storage().at(at).fetch(&$call).await?;
             Ok(owner_opt.map(account_to_raw32))
+        }};
+    }
+
+    match chain.name {
+        // Polkadot
+        "Polkadot Asset Hub" => {
+            let kt = ahp_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = ahp_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
         }
-        Chain::Ahp => {
-            let kt = ahp::runtime_types::sp_core::crypto::KeyTypeId(*b"aura");
-            let call = ahp::storage().session().key_owner((kt, session_key_raw32.to_vec()));
-            let owner_opt = api.storage().at(at).fetch(&call).await?;
-            Ok(owner_opt.map(account_to_raw32))
+        "Polkadot Bridge Hub" => {
+            let kt = bridgehub_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = bridgehub_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
         }
+        "Polkadot Coretime" => {
+            let kt = coretime_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = coretime_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Polkadot Collectives" => {
+            let kt = collectives_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = collectives_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Polkadot People" => {
+            let kt = people_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = people_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        // Kusama
+        "Kusama Asset Hub" => {
+            let kt = ahp_kusama::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = ahp_kusama::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Kusama Bridge Hub" => {
+            let kt = bridgehub_kusama::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = bridgehub_kusama::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Kusama Coretime" => {
+            let kt = coretime_kusama::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = coretime_kusama::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Kusama People" => {
+            let kt = people_kusama::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = people_kusama::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Kusama Encointer" => {
+            let kt = encointer_kusama::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = encointer_kusama::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        _ => Ok(None),
     }
 }
 
-/// Convert a runtime AccountId32 (opaque newtype) into [u8;32] by SCALE-encoding.
-fn account_to_raw32<T: Encode>(acc: T) -> [u8; 32] {
+/// Convert a runtime AccountId32 (opaque newtype) into [u8;32] by SCALE-encoding then truncating.
+fn account_to_raw32<T: parity_scale_codec::Encode>(acc: T) -> [u8; 32] {
     let bytes = acc.encode();
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes[..32]);
