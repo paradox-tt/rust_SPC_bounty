@@ -6,10 +6,10 @@ use jsonrpsee::core::client::ClientT;
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use parity_scale_codec::Encode;
-use serde_json;
+use serde_json::{self, Value};
 use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 use sp_core::{ed25519, sr25519, H256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -47,7 +47,6 @@ struct ChainCfg {
     name: &'static str,
     ws:   &'static str,
     ss58: u16,       // network prefix for AccountId SS58 (0 for DOT, 2 for KSM)
-    // true = aura session key is sr25519; false = ed25519 (used only for pretty-printing the session key)
     session_is_sr25519: bool,
 }
 
@@ -79,8 +78,8 @@ async fn main() -> Result<()> {
     let chain = prompt_chain()?;
     let Inputs { month, year, ema, fiat_opt } = prompt_inputs()?;
 
-    // Load identity map (SS58/42 -> primary identity)
-    let identity_map = load_identity_map_for_chain(&chain);
+    // Load identity map (SS58/42 -> primary identity), and expose path + size for debug
+    let id_src = load_identity_source_for_chain(&chain);
 
     // compute window (capped at now)
     let now = Utc::now();
@@ -218,7 +217,6 @@ async fn main() -> Result<()> {
                                             map.entry(owner_raw).or_insert(sess_key);
                                         }
                                     } else {
-                                        // count as unknown for visibility
                                         {
                                             let mut u = unknowns.lock().await;
                                             *u += 1;
@@ -284,6 +282,9 @@ async fn main() -> Result<()> {
     let session_map = Arc::try_unwrap(owner_to_session).unwrap().into_inner();
     let total_scanned: usize = stats.values().copied().sum();
 
+    // Emit debug once per unique owner (avoid flooding)
+    let mut debug_emitted: HashSet<[u8;32]> = HashSet::new();
+
     // rows: (identity_or_dash, owner_ss58, count, %total)
     let mut rows: Vec<(String, String, usize, f64)> = stats
         .into_iter()
@@ -293,9 +294,19 @@ async fn main() -> Result<()> {
                 ("-".to_string(), "UNKNOWN".to_string(), cnt, pct_total)
             } else {
                 let owner_ss58_native = ss58_from_raw32_with_prefix(owner_raw, chain.ss58);
-                // Lookup in identity map: convert to SS58/42 for key
+                // Convert to SS58/42 for identity lookup
                 let owner_ss58_42 = ss58_from_raw32_with_prefix(owner_raw, 42);
-                let identity = identity_map.get(&owner_ss58_42).cloned().unwrap_or_else(|| "-".to_string());
+
+                if !debug_emitted.contains(&owner_raw) {
+                    debug_emitted.insert(owner_raw);
+                    let chain_family = if chain.name.starts_with("Kusama") { "Kusama" } else { "Polkadot" };
+                    eprintln!(
+                        "DEBUG identity: Looking up address {} for {} address {}, using {} ({} entries)",
+                        owner_ss58_42, chain_family, owner_ss58_native, id_src.path, id_src.size_hint
+                    );
+                }
+
+                let identity = id_src.map.get(&owner_ss58_42).cloned().unwrap_or_else(|| "-".to_string());
 
                 let pct_total = if total_scanned > 0 { (cnt as f64) * 100.0 / (total_scanned as f64) } else { 0.0 };
                 (identity, owner_ss58_native, cnt, pct_total)
@@ -430,22 +441,146 @@ fn prompt_inputs() -> Result<Inputs> {
 
 // ---------------- identity loader ----------------
 
-fn load_identity_map_for_chain(chain: &ChainCfg) -> HashMap<String, String> {
-    // Polkadot chains -> polkadot-identities.json
-    // Kusama   chains -> kusama-identities.json
-    let path = if chain.name.starts_with("Kusama") {
+struct IdentitySource {
+    map: HashMap<String, String>, // key: SS58/42 address, val: primary display text
+    path: &'static str,
+    size_hint: usize,             // how many raw items we saw (for debug)
+}
+
+fn load_identity_source_for_chain(chain: &ChainCfg) -> IdentitySource {
+    let path: &'static str = if chain.name.starts_with("Kusama") {
         "assets/kusama-identities.json"
     } else {
         "assets/polkadot-identities.json"
     };
 
-    match fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str::<HashMap<String, String>>(&s).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+    let (map, size_hint, why) = match fs::read_to_string(path) {
+        Ok(s) => {
+            match serde_json::from_str::<Value>(&s) {
+                Ok(v) => {
+                    let (m, raw_count) = build_identity_map_from_value(&v);
+                    if m.is_empty() {
+                        eprintln!("DEBUG identity: parsed 0 entries from {}, raw_count={}, format={}", path, raw_count, guess_shape(&v));
+                    } else {
+                        eprintln!("DEBUG identity: parsed {} usable entries from {}, raw_count={}, format={}", m.len(), path, raw_count, guess_shape(&v));
+                    }
+                    (m, raw_count, None)
+                }
+                Err(e) => {
+                    eprintln!("DEBUG identity: failed to parse JSON from {}: {}", path, e);
+                    (HashMap::new(), 0, Some("json-parse-failed"))
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("DEBUG identity: failed to read {}: {}", path, e);
+            (HashMap::new(), 0, Some("read-failed"))
+        }
+    };
+
+    if let Some(reason) = why {
+        eprintln!("DEBUG identity: identity source fallback to empty map, reason={}", reason);
+    }
+
+    IdentitySource { map, path, size_hint }
+}
+
+/// Try to extract a map<SS58/42, primary_identity> from many shapes.
+fn build_identity_map_from_value(v: &Value) -> (HashMap<String, String>, usize) {
+    let mut out: HashMap<String, String> = HashMap::new();
+    match v {
+        Value::Object(obj) => {
+            // Case A: flat map "42addr" -> "Identity"
+            // Or "42addr" -> {display: "..."} etc.
+            let raw_count = obj.len();
+            for (k, val) in obj {
+                if let Some(id) = extract_identity_from_value(val) {
+                    out.insert(k.trim().to_string(), id);
+                } else if let Value::String(s) = val {
+                    out.insert(k.trim().to_string(), s.trim().to_string());
+                }
+            }
+            (out, raw_count)
+        }
+        Value::Array(arr) => {
+            // Case B: array of entries
+            let raw_count = arr.len();
+            for item in arr {
+                if let Some((addr42, primary)) = extract_entry(item) {
+                    out.insert(addr42, primary);
+                }
+            }
+            (out, raw_count)
+        }
+        _ => (out, 0),
     }
 }
 
-// ---------------- typed storage helpers ----------------
+/// Guess a human-readable shape for debugging
+fn guess_shape(v: &Value) -> &'static str {
+    match v {
+        Value::Object(_) => "object",
+        Value::Array(a) => {
+            if a.first().and_then(|x| x.as_object()).is_some() { "array<object>" } else { "array" }
+        }
+        _ => "other",
+    }
+}
+
+/// Extract a single entry from an array item into (ss58_42, primary_display)
+fn extract_entry(v: &Value) -> Option<(String, String)> {
+    let obj = v.as_object()?;
+    // Potential address keys commonly used
+    let addr = obj.get("ss58_42")
+        .or_else(|| obj.get("ss58"))
+        .or_else(|| obj.get("address"))
+        .or_else(|| obj.get("account"))
+        .or_else(|| obj.get("stash"))
+        .or_else(|| obj.get("owner"))?;
+
+    let addr = addr.as_str()?.trim().to_string();
+    if addr.is_empty() { return None; }
+
+    // Potential identity/display keys
+    let primary = extract_identity_from_value(v)
+        .or_else(|| obj.get("display").and_then(|x| x.as_str().map(|s| s.to_string())))
+        .or_else(|| obj.get("name").and_then(|x| x.as_str().map(|s| s.to_string())))
+        .or_else(|| obj.get("identity").and_then(|x| x.as_str().map(|s| s.to_string())))
+        .unwrap_or_else(|| "-".to_string());
+
+    Some((addr, primary))
+}
+
+/// Extract identity string from varied shapes:
+/// - {"primary":"Name"} or {"Primary Identity":"Name"}
+/// - {"identity":{"display":"Name"}} etc.
+fn extract_identity_from_value(v: &Value) -> Option<String> {
+    if let Some(obj) = v.as_object() {
+        if let Some(s) = obj.get("primary").and_then(|x| x.as_str()) {
+            return Some(s.trim().to_string());
+        }
+        if let Some(s) = obj.get("Primary Identity").and_then(|x| x.as_str()) {
+            return Some(s.trim().to_string());
+        }
+        if let Some(id) = obj.get("identity") {
+            if let Some(s) = id.get("display").and_then(|x| x.as_str()) {
+                return Some(s.trim().to_string());
+            }
+            if let Some(s) = id.get("info").and_then(|x| x.get("display")).and_then(|x| x.as_str()) {
+                return Some(s.trim().to_string());
+            }
+        }
+        if let Some(s) = obj.get("display").and_then(|x| x.as_str()) {
+            return Some(s.trim().to_string());
+        }
+        if let Some(s) = obj.get("name").and_then(|x| x.as_str()) {
+            return Some(s.trim().to_string());
+        }
+    }
+    None
+}
+
+// ---------------- typed storage + scan helpers ----------------
 
 async fn block_hash_by_number(rpc: &Arc<jsonrpsee::ws_client::WsClient>, number: u32) -> Result<H256> {
     let hex: String = tokio::time::timeout(
@@ -525,7 +660,7 @@ async fn derive_session_key_typed(
             let slot_opt = $slot_opt;
             let auths_opt = $auths_opt;
             if let (Some(slot), Some(bv)) = (slot_opt, auths_opt) {
-                let v = bv.0; // Vec<app_*::Public>
+                let v = bv.0;
                 if v.is_empty() { None } else {
                     let idx = (slot.0 as usize) % v.len();
                     Some(v[idx].0)
