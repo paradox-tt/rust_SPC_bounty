@@ -234,7 +234,7 @@ fn save_to_csv(
 
     // Create folder: output/{YYYY-MM}/{relay_chain}/
     let folder_name = format!("{:04}-{:02}", year, month);
-    let output_dir = PathBuf::from("output")
+    let output_dir = PathBuf::from("../../../SystemCollatorCSVFiles")
         .join(&folder_name)
         .join(relay_chain);
 
