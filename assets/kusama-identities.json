@@ -16,6 +16,37 @@
         "sub": ""
     },
     {
+      "address": "5Dsed6sNwpaVER5oMWsk1VFxQDnd8G5dshWiFxqYSUcMdUGR",
+      "email": "",
+      "matrix": "???",
+      "twitter": "???",
+      "name": "Polkadotters",
+      "sub": "Core"
+    },
+  {
+    "address": "5C7tUQeNyydnrgEYnmbXJ6D2zZzQZmeW9mTqgZovFd1u7m2y",
+    "email": "???",
+    "matrix": "???",
+    "twitter": "???",
+    "name": "CoinStudio ",
+    "sub": "System"
+  },
+  {
+    "address": "5ESBD7FeEqAtaPDd8qCetyhbVy3gc622zQ1SECS1p2mM9zRz",
+    "email": "???",
+    "matrix": "???",
+    "twitter": "???",
+    "name": "Tuxedo ",
+    "sub": "Sys"
+  },
+  {
+    "address": "5FWSFd4NYUB7Pa8Mq4dS3LFEjgmaUFy9pcqqBTFapJQcCXd7",
+    "email": "???",
+    "matrix": "???",
+    "twitter": "???",
+    "name": "ExtraCoin ",
+    "sub":
+    {
         "address": "5DhBWzAQmXUjZXeupBNKzWktXokLCXTGPB3nTNDu2HWdctb2",
         "email": "???",
         "matrix": "???",
