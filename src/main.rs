@@ -5,10 +5,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
-use parity_scale_codec::Encode;
-use serde_json::{self, Value};
+use serde::Deserialize;
 use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
-use sp_core::{ed25519, sr25519, H256};
+use sp_core::{sr25519, H256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -47,6 +46,7 @@ struct ChainCfg {
     name: &'static str,
     ws:   &'static str,
     ss58: u16,       // network prefix for AccountId SS58 (0 for DOT, 2 for KSM)
+    // true = aura session key is sr25519; false = ed25519 (only used for debugging session key, if needed)
     session_is_sr25519: bool,
 }
 
@@ -72,14 +72,157 @@ const CONCURRENCY: usize = 32;
 const CHUNK_CONCURRENCY: usize = 20;
 const CALL_TIMEOUT_SECS: u64 = 20;
 
+// ---------------- NO-REWARD LIST & BOUNTY CONFIG ----------------
+
+// Parity & Encointer collators over all chains, plus mischief anon collators.
+// NOTE: These are chain-prefixed SS58 addresses (0=DOT, 2=KSM), not generic 42.
+const NO_REWARD_COLLATORS: &[&str] = &[
+    // Polkadot AssetHub
+    "12ixt2xmCJKuLXjM3gh1SY7C3aj4gBoBUqExTBTGhLCSATFw",
+    "15X2eHehrexKqz6Bs6fQTjptP2ndn39eYdQTeREVeRk32p54",
+    // Polkadot BridgeHub
+    "134AK3RiMA97Fx9dLj1CvuLJUa8Yo93EeLA1TkP6CCGnWMSd",
+    "15dU8Tt7kde2diuHzijGbKGPU5K8BPzrFJfYFozvrS1DdE21",
+    // Polkadot Collectives
+    "1NvWYSswSt5v95m5z9JycedzTXEWJ9Zcgbu5BMnGAwiWUC9",
+    "12n87jggYnvxvdHJaEiTAKZF7ZniJqxafYoKzEqfJCUDvJXP",
+    // Polkadot People
+    "14QhqUX7kux5PggbBwUFFZNuLvfX2CjzUQ9V56m4d4S67Pgn",
+    "14QhqUX7kux5PggbBwUFFZNuLvfX2CjzUQ9V56m4d4S67Pgn",
+    // Polkadot Coretime
+    "13NAwtroa2efxgtih1oscJqjxcKpWJeQF8waWPTArBewi2CQ",
+    "13umUoWwGb765EPzMUrMmYTcEjKfNJiNyCDwdqAvCMzteGzi",
+    // Kusama AssetHub
+    "EPk1wv1TvVFfsiG73YLuLAtGacfPmojyJKvmifobBzUTxFv",
+    "JL21EURyqQxJk9inVW7iuexJNzzuV7HpZJVxQrY8BzwFiTJ",
+    // Kusama BridgeHub
+    "DQkekNBt8g6D7bPUEqhgfujADxzzfivr1qQZJkeGzAqnEzF",
+    "HbUc5qrLtKAZvasioiTSf1CunaN2SyEwvfsgMuYQjXA5sfk",
+    // Kusama Coretime
+    "Cx9Uu2sxp3Xt1QBUbGQo7j3imTvjWJrqPF1PApDoy6UVkWP",
+    "HRn3a4qLmv1ejBHvEbnjaiEWjt154iFi2Wde7bXKGUwGvtL",
+    // Kusama People
+    // "CbLd7BdUr8DqD4TciR1kH6w12bbHBCW9n2MHGCtbxq4U5ty", // BLD (commented in your list)
+    "CuLgnS17KwfweeoN9y59YrhDG4pekfiY8qxieDaVTcVCjuP",
+    // "E8X4LxU9zEiNVAyM95ERDeomMmwwqn7RBCuRMEZCfgFm3J1", // Openbit Labs
+    "HNrgbuMxf7VLwsMd6YjnNQM6fc7VVsaoNVaMYTCCfK3TRWJ",
+    // Kusama Encointer
+    "FG2C6WJWFdBNgKGDdS6oyhP1K9zHLNNzRtvAJNbmV1FybzD",
+    "Fsn4ArZxAtESoGmwnLVbiKPsrgjFNmGLLdVapjVPCD78mRA",
+    "G6z6FmKhw6dHJ8a5tetrzarbsVU4jF8LhoRFk211GryqAdw",
+    "GwDHvd1aToQRKa2b9rATV5igF99Bwr12Ko7jDZfPdNBTGT4",
+    // RAVEN (excluded due to identity theft)
+    "FRt6xsJzQp8isxEXTRGVfymNaosKbWihPCqy7XFKd9v5y6X",
+];
+
+const KUSAMA_PARENT_BOUNTY_ID: u32 = 20;
+const POLKADOT_PARENT_BOUNTY_ID: u32 = 32;
+
+const KSM_CURATOR_ACCOUNT: &str = "GsGcRLXWFcVnxUaWVE9ojJpnDNM9R7QNxYBrshWtnTcohyc";
+const DOT_CURATOR_ACCOUNT: &str = "15NCSvkYjtf2G1fvtYVnLCSPmKiZk3ReX1AUWsSDD5ocFVXa";
+
+// ---------------- identity JSON ----------------
+
+#[derive(Debug, Deserialize)]
+struct IdentityJson {
+    address: String, // 42-prefix SS58
+    name: String,
+    #[serde(default)]
+    sub: String,
+}
+
+#[derive(Debug, Default)]
+struct IdentityMaps {
+    // key: 42-prefix SS58, value: "Primary/Sub" or just "Primary"
+    polkadot: HashMap<String, String>,
+    kusama: HashMap<String, String>,
+}
+
+impl IdentityMaps {
+    fn load() -> Result<Self> {
+        let mut m = IdentityMaps::default();
+
+        // Polkadot
+        match fs::read_to_string("assets/polkadot-identities.json") {
+            Ok(s) => {
+                let list: Vec<IdentityJson> = serde_json::from_str(&s)
+                    .context("parse assets/polkadot-identities.json")?;
+                for e in list {
+                    let display = if e.sub.trim().is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{}/{}", e.name, e.sub)
+                    };
+                    m.polkadot.insert(e.address, display);
+                }
+                eprintln!(
+                    "Loaded {} entries from assets/polkadot-identities.json",
+                    m.polkadot.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("WARN: cannot read assets/polkadot-identities.json: {e}");
+            }
+        }
+
+        // Kusama
+        match fs::read_to_string("assets/kusama-identities.json") {
+            Ok(s) => {
+                let list: Vec<IdentityJson> = serde_json::from_str(&s)
+                    .context("parse assets/kusama-identities.json")?;
+                for e in list {
+                    let display = if e.sub.trim().is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{}/{}", e.name, e.sub)
+                    };
+                    m.kusama.insert(e.address, display);
+                }
+                eprintln!(
+                    "Loaded {} entries from assets/kusama-identities.json",
+                    m.kusama.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("WARN: cannot read assets/kusama-identities.json: {e}");
+            }
+        }
+
+        Ok(m)
+    }
+
+    fn lookup(&self, chain: &ChainCfg, owner_raw: [u8; 32]) -> Option<String> {
+        // Convert chain-specific AccountId32 (raw) to generic 42-prefix Substrate SS58
+        let generic_fmt = Ss58AddressFormat::substrate_account(); // 42
+        let generic_ss58 = sr25519::Public::from_raw(owner_raw).to_ss58check_with_version(generic_fmt);
+
+        let (which, map) = if chain.ss58 == 0 {
+            ("Polkadot", &self.polkadot)
+        } else {
+            ("Kusama", &self.kusama)
+        };
+
+        eprintln!(
+            "DEBUG identity: Looking up generic address {} for {} chain, using {} entries",
+            generic_ss58,
+            which,
+            map.len()
+        );
+        map.get(&generic_ss58).cloned()
+    }
+}
+
 // ---------------- main ----------------
 #[tokio::main]
 async fn main() -> Result<()> {
     let chain = prompt_chain()?;
     let Inputs { month, year, ema, fiat_opt } = prompt_inputs()?;
 
-    // Load identity map (SS58/42 -> primary identity), and expose path + size for debug
-    let id_src = load_identity_source_for_chain(&chain);
+    // identities
+    let identity_maps = IdentityMaps::load().unwrap_or_else(|e| {
+        eprintln!("WARN: identity loading failed: {e:#}");
+        IdentityMaps::default()
+    });
 
     // compute window (capped at now)
     let now = Utc::now();
@@ -163,8 +306,6 @@ async fn main() -> Result<()> {
 
     // stats keyed by OWNER AccountId32 raw
     let stats: Arc<Mutex<HashMap<[u8; 32], usize>>> = Arc::new(Mutex::new(HashMap::new()));
-    // keep last-seen session key per owner (to display)
-    let owner_to_session: Arc<Mutex<HashMap<[u8;32], [u8;32]>>> = Arc::new(Mutex::new(HashMap::new()));
     let unknowns = Arc::new(Mutex::new(0usize));
     let block_errors = Arc::new(Mutex::new(0usize));
 
@@ -180,7 +321,6 @@ async fn main() -> Result<()> {
                 let pb_for_tasks = chunk_pb.clone();
                 let unknowns = unknowns.clone();
                 let block_errors = block_errors.clone();
-                let owner_to_session = owner_to_session.clone();
                 let chain = chain;
 
                 async move {
@@ -194,7 +334,6 @@ async fn main() -> Result<()> {
                         let overall_pb = overall_pb.clone();
                         let unknowns = unknowns.clone();
                         let block_errors = block_errors.clone();
-                        let owner_to_session = owner_to_session.clone();
                         let chain = chain;
 
                         async move {
@@ -207,34 +346,19 @@ async fn main() -> Result<()> {
                                 // 2) resolve owner via Session::KeyOwner((KeyTypeId("aura"), key_bytes))
                                 if let Some(sess_key) = session_key_opt {
                                     if let Some(owner_raw) = session_key_owner_account_typed(&api, h, chain, sess_key).await? {
-                                        // tally
-                                        {
-                                            let mut sm = stats.lock().await;
-                                            *sm.entry(owner_raw).or_insert(0) += 1;
-                                        }
-                                        {
-                                            let mut map = owner_to_session.lock().await;
-                                            map.entry(owner_raw).or_insert(sess_key);
-                                        }
+                                        let mut sm = stats.lock().await;
+                                        *sm.entry(owner_raw).or_insert(0) += 1;
                                     } else {
-                                        {
-                                            let mut u = unknowns.lock().await;
-                                            *u += 1;
-                                        }
-                                        {
-                                            let mut sm = stats.lock().await;
-                                            *sm.entry([0u8;32]).or_insert(0) += 1;
-                                        }
-                                    }
-                                } else {
-                                    {
                                         let mut u = unknowns.lock().await;
                                         *u += 1;
-                                    }
-                                    {
                                         let mut sm = stats.lock().await;
                                         *sm.entry([0u8;32]).or_insert(0) += 1;
                                     }
+                                } else {
+                                    let mut u = unknowns.lock().await;
+                                    *u += 1;
+                                    let mut sm = stats.lock().await;
+                                    *sm.entry([0u8;32]).or_insert(0) += 1;
                                 }
 
                                 // progress
@@ -244,10 +368,8 @@ async fn main() -> Result<()> {
                             }.await;
 
                             if let Err(e) = res {
-                                {
-                                    let mut be = block_errors.lock().await;
-                                    *be += 1;
-                                }
+                                let mut be = block_errors.lock().await;
+                                *be += 1;
                                 eprintln!("  [block #{n} error] {e:#}");
                             }
                             Ok::<(), anyhow::Error>(())
@@ -279,53 +401,64 @@ async fn main() -> Result<()> {
 
     // summary
     let stats = Arc::try_unwrap(stats).unwrap().into_inner();
-    let session_map = Arc::try_unwrap(owner_to_session).unwrap().into_inner();
     let total_scanned: usize = stats.values().copied().sum();
 
-    // Emit debug once per unique owner (avoid flooding)
-    let mut debug_emitted: HashSet<[u8;32]> = HashSet::new();
+    #[derive(Clone)]
+    struct Row {
+        owner_raw: [u8; 32],
+        author_ss58: String,
+        identity: String,
+        blocks: usize,
+        pct_total: f64,
+    }
 
-    // rows: (identity_or_dash, owner_ss58, count, %total)
-    let mut rows: Vec<(String, String, usize, f64)> = stats
+    // Build NO_REWARD set for quick membership test
+    let no_reward_set: HashSet<&'static str> = NO_REWARD_COLLATORS.iter().copied().collect();
+
+    let mut rows: Vec<Row> = stats
         .into_iter()
         .map(|(owner_raw, cnt)| {
             if owner_raw == [0u8; 32] {
-                let pct_total = if total_scanned > 0 { (cnt as f64) * 100.0 / (total_scanned as f64) } else { 0.0 };
-                ("-".to_string(), "UNKNOWN".to_string(), cnt, pct_total)
-            } else {
-                let owner_ss58_native = ss58_from_raw32_with_prefix(owner_raw, chain.ss58);
-                // Convert to SS58/42 for identity lookup
-                let owner_ss58_42 = ss58_from_raw32_with_prefix(owner_raw, 42);
-
-                if !debug_emitted.contains(&owner_raw) {
-                    debug_emitted.insert(owner_raw);
-                    let chain_family = if chain.name.starts_with("Kusama") { "Kusama" } else { "Polkadot" };
-                    eprintln!(
-                        "DEBUG identity: Looking up address {} for {} address {}, using {} ({} entries)",
-                        owner_ss58_42, chain_family, owner_ss58_native, id_src.path, id_src.size_hint
-                    );
+                Row {
+                    owner_raw,
+                    author_ss58: "UNKNOWN".to_string(),
+                    identity: "-".to_string(),
+                    blocks: cnt,
+                    pct_total: if total_scanned > 0 {
+                        (cnt as f64) * 100.0 / (total_scanned as f64)
+                    } else { 0.0 },
                 }
+            } else {
+                let author_ss58 = ss58_from_raw32_with_prefix(owner_raw, chain.ss58);
+                let identity = identity_maps
+                    .lookup(&chain, owner_raw)
+                    .unwrap_or_else(|| "".to_string());
 
-                let identity = id_src.map.get(&owner_ss58_42).cloned().unwrap_or_else(|| "-".to_string());
-
-                let pct_total = if total_scanned > 0 { (cnt as f64) * 100.0 / (total_scanned as f64) } else { 0.0 };
-                (identity, owner_ss58_native, cnt, pct_total)
+                Row {
+                    owner_raw,
+                    author_ss58,
+                    identity,
+                    blocks: cnt,
+                    pct_total: if total_scanned > 0 {
+                        (cnt as f64) * 100.0 / (total_scanned as f64)
+                    } else { 0.0 },
+                }
             }
         })
         .collect();
 
-    // Sort: UNKNOWN last, else by count desc
+    // Sort: known authors first by descending blocks, UNKNOWN at bottom
     rows.sort_by(|a, b| {
-        if a.1 == "UNKNOWN" && b.1 != "UNKNOWN" {
+        if a.author_ss58 == "UNKNOWN" && b.author_ss58 != "UNKNOWN" {
             std::cmp::Ordering::Greater
-        } else if b.1 == "UNKNOWN" && a.1 != "UNKNOWN" {
+        } else if b.author_ss58 == "UNKNOWN" && a.author_ss58 != "UNKNOWN" {
             std::cmp::Ordering::Less
         } else {
-            b.2.cmp(&a.2)
+            b.blocks.cmp(&a.blocks)
         }
     });
 
-    let max_count = rows.iter().map(|(_, _, c, _)| *c).max().unwrap_or(0);
+    let max_count = rows.iter().map(|r| r.blocks).max().unwrap_or(0);
 
     println!("\n================ SUMMARY (full scan) ================");
     println!("Chain:      {}", chain.name);
@@ -333,27 +466,130 @@ async fn main() -> Result<()> {
     println!("Window:     [{} .. {})", start_dt.to_rfc3339(), end_dt.to_rfc3339());
     println!("Blocks scanned: {}", total_scanned);
     println!(
-        "{:<6}  {:<40}  {:<58}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}",
-        "Rank", "Identity", "Owner (SS58)", "Blocks", "%", "%Top", "Payout", "Payout/EMA"
+        "{:<6}  {:<48}  {:<28}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}",
+        "Rank","Author (Owner SS58)","Identity","Blocks","%","%Top","Payout","Payout/EMA"
     );
-    println!("{}", "-".repeat(160));
+    println!("{}", "-".repeat(140));
 
-    for (i, (identity, owner_ss58, cnt, pct_total)) in rows.iter().enumerate() {
-        let pct_top = if max_count > 0 { (*cnt as f64) * 100.0 / (max_count as f64) } else { 0.0 };
+    for (i, row) in rows.iter().enumerate() {
+        let pct_top = if max_count > 0 {
+            (row.blocks as f64) * 100.0 / (max_count as f64)
+        } else { 0.0 };
         let payout = REWARD_USD * (pct_top / 100.0);
         let payout_per_ema = payout / ema;
+        let id_display = if row.identity.is_empty() { "-".to_string() } else { row.identity.clone() };
 
         println!(
-            "{:<6}  {:<40}  {:<58}  {:>8}  {:>7.2}  {:>7.2}  {:>9.2}  {:>11.6}",
-            i + 1, identity, owner_ss58, cnt, pct_total, pct_top, payout, payout_per_ema
+            "{:<6}  {:<48}  {:<28}  {:>8}  {:>7.2}  {:>7.2}  {:>9.2}  {:>11.6}",
+            i + 1,
+            row.author_ss58,
+            id_display,
+            row.blocks,
+            row.pct_total,
+            pct_top,
+            payout,
+            payout_per_ema
         );
     }
-    println!("{}", "-".repeat(160));
-    println!("Note: 'Identity' uses a local dump keyed by SS58/42; Owner is shown in the chain's native prefix (0=DOT, 2=KSM).");
+    println!("{}", "-".repeat(140));
+    println!("Note: '%' is share of all blocks in window; '%Top' is relative to the top producer.");
     println!("Assumed reward pool for '%Top' payout: ${:.2}", REWARD_USD);
     println!("EMA used: {}", ema);
 
-    println!("==> Done.");
+    // diagnostics
+    let unknowns = Arc::try_unwrap(unknowns).unwrap().into_inner();
+    let block_errors = Arc::try_unwrap(block_errors).unwrap().into_inner();
+    eprintln!("Diagnostics: unknown-authors={}, block-errors={}", unknowns, block_errors);
+
+    // ---------------- child-bounty PLAN (no SCALE encoding yet) ----------------
+    println!();
+    println!("Optional: you can now generate a child-bounty plan based on this table.");
+    println!("This will NOT encode SCALE call data yet; it just computes which child bounty ID");
+    println!("should be assigned to which collator, skipping UNKNOWN and the NO_REWARD list.\n");
+
+    let maybe_start = prompt_child_bounty_start()?;
+    if let Some(start_id) = maybe_start {
+        let is_polkadot = chain.ss58 == 0;
+        let parent_id = if is_polkadot {
+            POLKADOT_PARENT_BOUNTY_ID
+        } else {
+            KUSAMA_PARENT_BOUNTY_ID
+        };
+        let curator = if is_polkadot {
+            DOT_CURATOR_ACCOUNT
+        } else {
+            KSM_CURATOR_ACCOUNT
+        };
+
+        println!("\n================ CHILD BOUNTY PLAN (logical) ================");
+        println!(
+            "Relay chain: {}  |  parent bounty id: {}  |  curator: {}",
+            if is_polkadot { "Polkadot" } else { "Kusama" },
+            parent_id,
+            curator
+        );
+        println!("First child bounty id: {}", start_id);
+        println!("NO_REWARD_COLLATORS exclusions: {} entries\n", NO_REWARD_COLLATORS.len());
+
+        let mut child_id = start_id;
+        let mut awarded_rows = 0usize;
+
+        for row in &rows {
+            if row.author_ss58 == "UNKNOWN" {
+                continue;
+            }
+            if no_reward_set.contains(row.author_ss58.as_str()) {
+                println!(
+                    "SKIP (no reward list): {} ({})",
+                    row.author_ss58,
+                    if row.identity.is_empty() { "-" } else { row.identity.as_str() }
+                );
+                continue;
+            }
+
+            let id_display = if row.identity.is_empty() { "-" } else { row.identity.as_str() };
+            println!(
+                "Child bounty #{} (parent={}): award to {} ({})  |  blocks={}  |  %Top-like weight=~{:.2}",
+                child_id,
+                parent_id,
+                row.author_ss58,
+                id_display,
+                row.blocks,
+                if max_count > 0 {
+                    (row.blocks as f64) * 100.0 / (max_count as f64)
+                } else {
+                    0.0
+                },
+            );
+
+            println!("  -> Logical call sequence (pseudo):");
+            println!("     - child_bounties.add_child_bounty(parent_id={}, child_id={})", parent_id, child_id);
+            println!("     - child_bounties.propose_curator(parent_id={}, child_id={}, curator={}, fee=...)",
+                     parent_id, child_id, curator);
+            println!("     - child_bounties.accept_curator(parent_id={}, child_id={})", parent_id, child_id);
+            println!("     - child_bounties.award_child_bounty(parent_id={}, child_id={}, beneficiary={})",
+                     parent_id, child_id, row.author_ss58);
+            println!();
+
+            child_id += 1;
+            awarded_rows += 1;
+        }
+
+        if awarded_rows == 0 {
+            println!("No eligible collators for child-bounty awards after exclusions.");
+        } else {
+            println!(
+                "Planned {} child bounties from id {} to {} (inclusive).",
+                awarded_rows,
+                start_id,
+                child_id - 1
+            );
+            println!("\nNOTE: This is a logical plan only — you still need to encode these into");
+            println!("      actual SCALE RuntimeCall hex for the relevant relay chain.");
+        }
+    }
+
+    println!("\n==> Done.");
     Ok(())
 }
 
@@ -439,148 +675,23 @@ fn prompt_inputs() -> Result<Inputs> {
     Ok(Inputs { month, year, ema, fiat_opt })
 }
 
-// ---------------- identity loader ----------------
-
-struct IdentitySource {
-    map: HashMap<String, String>, // key: SS58/42 address, val: primary display text
-    path: &'static str,
-    size_hint: usize,             // how many raw items we saw (for debug)
-}
-
-fn load_identity_source_for_chain(chain: &ChainCfg) -> IdentitySource {
-    let path: &'static str = if chain.name.starts_with("Kusama") {
-        "assets/kusama-identities.json"
+fn prompt_child_bounty_start() -> Result<Option<u32>> {
+    println!("Enter the FIRST child bounty id to use (or just Enter to skip child-bounty planning):");
+    print!("First child bounty id: ");
+    io::stdout().flush().ok();
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    let t = s.trim();
+    if t.is_empty() {
+        Ok(None)
     } else {
-        "assets/polkadot-identities.json"
-    };
-
-    let (map, size_hint, why) = match fs::read_to_string(path) {
-        Ok(s) => {
-            match serde_json::from_str::<Value>(&s) {
-                Ok(v) => {
-                    let (m, raw_count) = build_identity_map_from_value(&v);
-                    if m.is_empty() {
-                        eprintln!("DEBUG identity: parsed 0 entries from {}, raw_count={}, format={}", path, raw_count, guess_shape(&v));
-                    } else {
-                        eprintln!("DEBUG identity: parsed {} usable entries from {}, raw_count={}, format={}", m.len(), path, raw_count, guess_shape(&v));
-                    }
-                    (m, raw_count, None)
-                }
-                Err(e) => {
-                    eprintln!("DEBUG identity: failed to parse JSON from {}: {}", path, e);
-                    (HashMap::new(), 0, Some("json-parse-failed"))
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("DEBUG identity: failed to read {}: {}", path, e);
-            (HashMap::new(), 0, Some("read-failed"))
-        }
-    };
-
-    if let Some(reason) = why {
-        eprintln!("DEBUG identity: identity source fallback to empty map, reason={}", reason);
-    }
-
-    IdentitySource { map, path, size_hint }
-}
-
-/// Try to extract a map<SS58/42, primary_identity> from many shapes.
-fn build_identity_map_from_value(v: &Value) -> (HashMap<String, String>, usize) {
-    let mut out: HashMap<String, String> = HashMap::new();
-    match v {
-        Value::Object(obj) => {
-            // Case A: flat map "42addr" -> "Identity"
-            // Or "42addr" -> {display: "..."} etc.
-            let raw_count = obj.len();
-            for (k, val) in obj {
-                if let Some(id) = extract_identity_from_value(val) {
-                    out.insert(k.trim().to_string(), id);
-                } else if let Value::String(s) = val {
-                    out.insert(k.trim().to_string(), s.trim().to_string());
-                }
-            }
-            (out, raw_count)
-        }
-        Value::Array(arr) => {
-            // Case B: array of entries
-            let raw_count = arr.len();
-            for item in arr {
-                if let Some((addr42, primary)) = extract_entry(item) {
-                    out.insert(addr42, primary);
-                }
-            }
-            (out, raw_count)
-        }
-        _ => (out, 0),
+        let id: u32 = t.parse()
+            .map_err(|e| anyhow!("invalid child bounty id '{t}': {e}"))?;
+        Ok(Some(id))
     }
 }
 
-/// Guess a human-readable shape for debugging
-fn guess_shape(v: &Value) -> &'static str {
-    match v {
-        Value::Object(_) => "object",
-        Value::Array(a) => {
-            if a.first().and_then(|x| x.as_object()).is_some() { "array<object>" } else { "array" }
-        }
-        _ => "other",
-    }
-}
-
-/// Extract a single entry from an array item into (ss58_42, primary_display)
-fn extract_entry(v: &Value) -> Option<(String, String)> {
-    let obj = v.as_object()?;
-    // Potential address keys commonly used
-    let addr = obj.get("ss58_42")
-        .or_else(|| obj.get("ss58"))
-        .or_else(|| obj.get("address"))
-        .or_else(|| obj.get("account"))
-        .or_else(|| obj.get("stash"))
-        .or_else(|| obj.get("owner"))?;
-
-    let addr = addr.as_str()?.trim().to_string();
-    if addr.is_empty() { return None; }
-
-    // Potential identity/display keys
-    let primary = extract_identity_from_value(v)
-        .or_else(|| obj.get("display").and_then(|x| x.as_str().map(|s| s.to_string())))
-        .or_else(|| obj.get("name").and_then(|x| x.as_str().map(|s| s.to_string())))
-        .or_else(|| obj.get("identity").and_then(|x| x.as_str().map(|s| s.to_string())))
-        .unwrap_or_else(|| "-".to_string());
-
-    Some((addr, primary))
-}
-
-/// Extract identity string from varied shapes:
-/// - {"primary":"Name"} or {"Primary Identity":"Name"}
-/// - {"identity":{"display":"Name"}} etc.
-fn extract_identity_from_value(v: &Value) -> Option<String> {
-    if let Some(obj) = v.as_object() {
-        if let Some(s) = obj.get("primary").and_then(|x| x.as_str()) {
-            return Some(s.trim().to_string());
-        }
-        if let Some(s) = obj.get("Primary Identity").and_then(|x| x.as_str()) {
-            return Some(s.trim().to_string());
-        }
-        if let Some(id) = obj.get("identity") {
-            if let Some(s) = id.get("display").and_then(|x| x.as_str()) {
-                return Some(s.trim().to_string());
-            }
-            if let Some(s) = id.get("info").and_then(|x| x.get("display")).and_then(|x| x.as_str()) {
-                return Some(s.trim().to_string());
-            }
-        }
-        if let Some(s) = obj.get("display").and_then(|x| x.as_str()) {
-            return Some(s.trim().to_string());
-        }
-        if let Some(s) = obj.get("name").and_then(|x| x.as_str()) {
-            return Some(s.trim().to_string());
-        }
-    }
-    None
-}
-
-// ---------------- typed storage + scan helpers ----------------
+// ---------------- typed storage helpers ----------------
 
 async fn block_hash_by_number(rpc: &Arc<jsonrpsee::ws_client::WsClient>, number: u32) -> Result<H256> {
     let hex: String = tokio::time::timeout(
@@ -851,7 +962,7 @@ async fn session_key_owner_account_typed(
 }
 
 /// Convert a runtime AccountId32 (opaque newtype) into [u8;32] by SCALE-encoding then truncating.
-fn account_to_raw32<T: Encode>(acc: T) -> [u8; 32] {
+fn account_to_raw32<T: parity_scale_codec::Encode>(acc: T) -> [u8; 32] {
     let bytes = acc.encode();
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes[..32]);
