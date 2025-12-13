@@ -16,6 +16,38 @@
         "sub": "v01"
     },
     {
+        "address": "5Fk2xoXgC5E69EvkiPzVm5jruBYYMZ4fuGX8DyXy3D5n9efe",
+        "email": "",
+        "matrix": "",
+        "twitter": "",
+        "name": "Coinstudio",
+        "sub": "BridgeHub"
+    },
+    {
+        "address": "5EsgzKyshLCJPGAGrMYH2WN7Ai6FpKwd9LP8aF5pNwAfKaia",
+        "email": "",
+        "matrix": "",
+        "twitter": "",
+        "name": "Coinstudio",
+        "sub": "Mega"
+    },
+    {
+        "address": "5EsgzKyshLCJPGAGrMYH2WN7Ai6FpKwd9LP8aF5pNwAfKaia",
+        "email": "",
+        "matrix": "",
+        "twitter": "",
+        "name": "Megatron",
+        "sub": ""
+    },
+    {
+        "address": "5EFpJYi5Yb3GdU4vJ1waBCqYVoGCjK1N7CnftWEUT5soKJ4E",
+        "email": "",
+        "matrix": "",
+        "twitter": "",
+        "name": "Tuxedo",
+        "sub": "SYS"
+    },
+    {
         "address": "5FfBQVTBB2h2PEWhpcuBafcZD9ALqsuZH54rfF9EsKpsDrcc",
         "email": "",
         "matrix": "",
@@ -38,6 +70,14 @@
         "twitter": "",
         "name": "Jaco",
         "sub": "v04"
+    },
+    {
+        "address": "5Ce7A8AsJxHingRgtJ9HoksfSGcErSdEUXXRYo7RgNGhaSWp",
+        "email": "",
+        "matrix": "",
+        "twitter": "",
+        "name": "HoneyStake.xyz",
+        "sub": "Collator"
     },
     {
         "address": "5FHgiQMfAerpE9TA5PSimCetRZ7WSciypamPf2Y92qT1fSX4",

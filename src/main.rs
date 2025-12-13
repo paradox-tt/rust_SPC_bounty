@@ -234,7 +234,7 @@ fn save_to_csv(
 
     // Create folder: output/{YYYY-MM}/{relay_chain}/
     let folder_name = format!("{:04}-{:02}", year, month);
-    let output_dir = PathBuf::from("../../../SystemCollatorCSVFiles")
+    let output_dir = PathBuf::from("../SystemCollatorCSVFiles")
         .join(&folder_name)
         .join(relay_chain);
 
@@ -297,7 +297,7 @@ fn save_to_csv(
 #[tokio::main]
 async fn main() -> Result<()> {
     let chain = prompt_chain()?;
-    let Inputs { month, year, ema, fiat_opt } = prompt_inputs()?;
+    let Inputs { month, year, ema } = prompt_inputs()?;
 
     // identities
     let identity_maps = IdentityMaps::load().unwrap_or_else(|e| {
@@ -318,9 +318,8 @@ async fn main() -> Result<()> {
     let end_ms = end_dt.timestamp_millis() as u64;
 
     println!(
-        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}{}",
-        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema,
-        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f / ema)).unwrap_or_default()
+        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}",
+        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema
     );
 
     // connections
@@ -598,7 +597,7 @@ async fn main() -> Result<()> {
 }
 
 // ---------------- interactive ----------------
-struct Inputs { month: u8, year: i32, ema: f64, fiat_opt: Option<f64> }
+struct Inputs { month: u8, year: i32, ema: f64 }
 
 fn prompt_chain() -> Result<ChainCfg> {
     loop {
@@ -664,19 +663,8 @@ fn prompt_inputs() -> Result<Inputs> {
             _ => { eprintln!("  -> Please enter a positive number."); continue; }
         }
     };
-    let fiat_opt = loop {
-        print!("Enter fiat amount for example conversion (optional, press Enter to skip): ");
-        io::stdout().flush().ok();
-        let mut s = String::new();
-        io::stdin().read_line(&mut s)?;
-        let t = s.trim();
-        if t.is_empty() { break None; }
-        match t.parse::<f64>() {
-            Ok(v) if v >= 0.0 => break Some(v),
-            _ => { eprintln!("  -> Enter a non-negative number or just press Enter to skip."); continue; }
-        }
-    };
-    Ok(Inputs { month, year, ema, fiat_opt })
+
+    Ok(Inputs { month, year, ema })
 }
 
 // ---------------- typed storage helpers ----------------
