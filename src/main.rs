@@ -11,6 +11,7 @@ use sp_core::{sr25519, H256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +21,10 @@ use tokio::sync::Mutex;
 // ====== Subxt metadata modules (one per chain) ======
 #[subxt::subxt(runtime_metadata_path = "metadata/asset-hub-polkadot.scale")]
 pub mod ahp_polkadot {}
+
+#[subxt::subxt(runtime_metadata_path = "metadata/asset-hub-kusama.scale")]
+pub mod ahp_kusama {}
+
 #[subxt::subxt(runtime_metadata_path = "metadata/bridge-hub-polkadot.scale")]
 pub mod bridgehub_polkadot {}
 #[subxt::subxt(runtime_metadata_path = "metadata/coretime-polkadot.scale")]
@@ -28,9 +33,6 @@ pub mod coretime_polkadot {}
 pub mod collectives_polkadot {}
 #[subxt::subxt(runtime_metadata_path = "metadata/people-polkadot.scale")]
 pub mod people_polkadot {}
-
-#[subxt::subxt(runtime_metadata_path = "metadata/asset-hub-kusama.scale")]
-pub mod ahp_kusama {}
 #[subxt::subxt(runtime_metadata_path = "metadata/bridge-hub-kusama.scale")]
 pub mod bridgehub_kusama {}
 #[subxt::subxt(runtime_metadata_path = "metadata/coretime-kusama.scale")]
@@ -72,7 +74,7 @@ const CONCURRENCY: usize = 32;
 const CHUNK_CONCURRENCY: usize = 20;
 const CALL_TIMEOUT_SECS: u64 = 20;
 
-// ---------------- NO-REWARD LIST & BOUNTY CONFIG ----------------
+// ---------------- NO-REWARD LIST ----------------
 
 // Parity & Encointer collators over all chains, plus mischief anon collators.
 // NOTE: These are chain-prefixed SS58 addresses (0=DOT, 2=KSM), not generic 42.
@@ -102,7 +104,7 @@ const NO_REWARD_COLLATORS: &[&str] = &[
     "Cx9Uu2sxp3Xt1QBUbGQo7j3imTvjWJrqPF1PApDoy6UVkWP",
     "HRn3a4qLmv1ejBHvEbnjaiEWjt154iFi2Wde7bXKGUwGvtL",
     // Kusama People
-    // "CbLd7BdUr8DqD4TciR1kH6w12bbHBCW9n2MHGCtbxq4U5ty", // BLD (commented in your list)
+    // "CbLd7BdUr8DqD4TciR1kH6w12bbHBCW9n2MHGCtbxq4U5ty", // BLD
     "CuLgnS17KwfweeoN9y59YrhDG4pekfiY8qxieDaVTcVCjuP",
     // "E8X4LxU9zEiNVAyM95ERDeomMmwwqn7RBCuRMEZCfgFm3J1", // Openbit Labs
     "HNrgbuMxf7VLwsMd6YjnNQM6fc7VVsaoNVaMYTCCfK3TRWJ",
@@ -115,12 +117,6 @@ const NO_REWARD_COLLATORS: &[&str] = &[
     "FRt6xsJzQp8isxEXTRGVfymNaosKbWihPCqy7XFKd9v5y6X",
 ];
 
-const KUSAMA_PARENT_BOUNTY_ID: u32 = 20;
-const POLKADOT_PARENT_BOUNTY_ID: u32 = 32;
-
-const KSM_CURATOR_ACCOUNT: &str = "GsGcRLXWFcVnxUaWVE9ojJpnDNM9R7QNxYBrshWtnTcohyc";
-const DOT_CURATOR_ACCOUNT: &str = "15NCSvkYjtf2G1fvtYVnLCSPmKiZk3ReX1AUWsSDD5ocFVXa";
-
 // ---------------- identity JSON ----------------
 
 #[derive(Debug, Deserialize)]
@@ -130,12 +126,20 @@ struct IdentityJson {
     #[serde(default)]
     sub: String,
 }
-
 #[derive(Debug, Default)]
 struct IdentityMaps {
     // key: 42-prefix SS58, value: "Primary/Sub" or just "Primary"
     polkadot: HashMap<String, String>,
     kusama: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct Row {
+    owner_raw: [u8; 32],
+    author_ss58: String,
+    identity: String,
+    blocks: usize,
+    pct_total: f64,
 }
 
 impl IdentityMaps {
@@ -193,8 +197,9 @@ impl IdentityMaps {
 
     fn lookup(&self, chain: &ChainCfg, owner_raw: [u8; 32]) -> Option<String> {
         // Convert chain-specific AccountId32 (raw) to generic 42-prefix Substrate SS58
-        let generic_fmt = Ss58AddressFormat::substrate_account(); // 42
-        let generic_ss58 = sr25519::Public::from_raw(owner_raw).to_ss58check_with_version(generic_fmt);
+        let generic_fmt = Ss58AddressFormat::custom(42); // 42 = generic Substrate prefix
+        let generic_ss58 =
+            sr25519::Public::from_raw(owner_raw).to_ss58check_with_version(generic_fmt);
 
         let (which, map) = if chain.ss58 == 0 {
             ("Polkadot", &self.polkadot)
@@ -210,6 +215,82 @@ impl IdentityMaps {
         );
         map.get(&generic_ss58).cloned()
     }
+}
+
+// ---------------- CSV saving ----------------
+
+/// Save collator data to CSV with organized folder structure
+fn save_to_csv(
+    rows: &[Row],
+    chain: &ChainCfg,
+    year: i32,
+    month: u8,
+    max_count: usize,
+    ema: f64,
+    no_reward_set: &HashSet<&str>,
+) -> Result<()> {
+    // Determine relay chain
+    let relay_chain = if chain.ss58 == 0 { "polkadot" } else { "kusama" };
+
+    // Create folder: output/{YYYY-MM}/{relay_chain}/
+    let folder_name = format!("{:04}-{:02}", year, month);
+    let output_dir = PathBuf::from("output")
+        .join(&folder_name)
+        .join(relay_chain);
+
+    std::fs::create_dir_all(&output_dir)?;
+
+    // Filename: sanitized chain name
+    let chain_name_sanitized = chain.name
+        .replace(" ", "_")
+        .to_lowercase();
+    let csv_path = output_dir.join(format!("{}.csv", chain_name_sanitized));
+
+    // Build CSV
+    let mut csv = String::new();
+    csv.push_str("address,identity,blocks,pct_total,pct_top,payout_usd,payout_tokens,skip_reason\n");
+
+    for row in rows {
+        if row.author_ss58 == "UNKNOWN" {
+            continue;
+        }
+
+        let pct_top = if max_count > 0 {
+            (row.blocks as f64) * 100.0 / (max_count as f64)
+        } else { 0.0 };
+
+        let payout_usd = 300.0 * (pct_top / 100.0);
+        let payout_tokens = payout_usd / ema;
+
+        let identity = if row.identity.is_empty() {
+            String::new()
+        } else {
+            format!("\"{}\"", row.identity.replace("\"", "\"\""))
+        };
+
+        let skip_reason = if no_reward_set.contains(row.author_ss58.as_str()) {
+            "no_reward_list"
+        } else {
+            ""
+        };
+
+        csv.push_str(&format!(
+            "{},{},{},{:.4},{:.4},{:.2},{:.10},{}\n",
+            row.author_ss58,
+            identity,
+            row.blocks,
+            row.pct_total,
+            pct_top,
+            payout_usd,
+            payout_tokens,
+            skip_reason
+        ));
+    }
+
+    std::fs::write(&csv_path, csv)?;
+    println!("✅ CSV saved: {}", csv_path.display());
+
+    Ok(())
 }
 
 // ---------------- main ----------------
@@ -239,7 +320,7 @@ async fn main() -> Result<()> {
     println!(
         "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}{}",
         chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema,
-        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f/ema)).unwrap_or_default()
+        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f / ema)).unwrap_or_default()
     );
 
     // connections
@@ -352,13 +433,13 @@ async fn main() -> Result<()> {
                                         let mut u = unknowns.lock().await;
                                         *u += 1;
                                         let mut sm = stats.lock().await;
-                                        *sm.entry([0u8;32]).or_insert(0) += 1;
+                                        *sm.entry([0u8; 32]).or_insert(0) += 1;
                                     }
                                 } else {
                                     let mut u = unknowns.lock().await;
                                     *u += 1;
                                     let mut sm = stats.lock().await;
-                                    *sm.entry([0u8;32]).or_insert(0) += 1;
+                                    *sm.entry([0u8; 32]).or_insert(0) += 1;
                                 }
 
                                 // progress
@@ -402,15 +483,6 @@ async fn main() -> Result<()> {
     // summary
     let stats = Arc::try_unwrap(stats).unwrap().into_inner();
     let total_scanned: usize = stats.values().copied().sum();
-
-    #[derive(Clone)]
-    struct Row {
-        owner_raw: [u8; 32],
-        author_ss58: String,
-        identity: String,
-        blocks: usize,
-        pct_total: f64,
-    }
 
     // Build NO_REWARD set for quick membership test
     let no_reward_set: HashSet<&'static str> = NO_REWARD_COLLATORS.iter().copied().collect();
@@ -467,7 +539,7 @@ async fn main() -> Result<()> {
     println!("Blocks scanned: {}", total_scanned);
     println!(
         "{:<6}  {:<48}  {:<28}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}",
-        "Rank","Author (Owner SS58)","Identity","Blocks","%","%Top","Payout","Payout/EMA"
+        "Rank", "Author (Owner SS58)", "Identity", "Blocks", "%", "%Top", "Payout", "Payout/EMA"
     );
     println!("{}", "-".repeat(140));
 
@@ -501,92 +573,24 @@ async fn main() -> Result<()> {
     let block_errors = Arc::try_unwrap(block_errors).unwrap().into_inner();
     eprintln!("Diagnostics: unknown-authors={}, block-errors={}", unknowns, block_errors);
 
-    // ---------------- child-bounty PLAN (no SCALE encoding yet) ----------------
-    println!();
-    println!("Optional: you can now generate a child-bounty plan based on this table.");
-    println!("This will NOT encode SCALE call data yet; it just computes which child bounty ID");
-    println!("should be assigned to which collator, skipping UNKNOWN and the NO_REWARD list.\n");
+    // Prompt and save CSV
+    println!("\n{}", "=".repeat(80));
+    print!("Save this data to CSV? (y/n): ");
+    io::stdout().flush()?;
 
-    let maybe_start = prompt_child_bounty_start()?;
-    if let Some(start_id) = maybe_start {
-        let is_polkadot = chain.ss58 == 0;
-        let parent_id = if is_polkadot {
-            POLKADOT_PARENT_BOUNTY_ID
-        } else {
-            KUSAMA_PARENT_BOUNTY_ID
-        };
-        let curator = if is_polkadot {
-            DOT_CURATOR_ACCOUNT
-        } else {
-            KSM_CURATOR_ACCOUNT
-        };
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
 
-        println!("\n================ CHILD BOUNTY PLAN (logical) ================");
-        println!(
-            "Relay chain: {}  |  parent bounty id: {}  |  curator: {}",
-            if is_polkadot { "Polkadot" } else { "Kusama" },
-            parent_id,
-            curator
-        );
-        println!("First child bounty id: {}", start_id);
-        println!("NO_REWARD_COLLATORS exclusions: {} entries\n", NO_REWARD_COLLATORS.len());
-
-        let mut child_id = start_id;
-        let mut awarded_rows = 0usize;
-
-        for row in &rows {
-            if row.author_ss58 == "UNKNOWN" {
-                continue;
-            }
-            if no_reward_set.contains(row.author_ss58.as_str()) {
-                println!(
-                    "SKIP (no reward list): {} ({})",
-                    row.author_ss58,
-                    if row.identity.is_empty() { "-" } else { row.identity.as_str() }
-                );
-                continue;
-            }
-
-            let id_display = if row.identity.is_empty() { "-" } else { row.identity.as_str() };
-            println!(
-                "Child bounty #{} (parent={}): award to {} ({})  |  blocks={}  |  %Top-like weight=~{:.2}",
-                child_id,
-                parent_id,
-                row.author_ss58,
-                id_display,
-                row.blocks,
-                if max_count > 0 {
-                    (row.blocks as f64) * 100.0 / (max_count as f64)
-                } else {
-                    0.0
-                },
-            );
-
-            println!("  -> Logical call sequence (pseudo):");
-            println!("     - child_bounties.add_child_bounty(parent_id={}, child_id={})", parent_id, child_id);
-            println!("     - child_bounties.propose_curator(parent_id={}, child_id={}, curator={}, fee=...)",
-                     parent_id, child_id, curator);
-            println!("     - child_bounties.accept_curator(parent_id={}, child_id={})", parent_id, child_id);
-            println!("     - child_bounties.award_child_bounty(parent_id={}, child_id={}, beneficiary={})",
-                     parent_id, child_id, row.author_ss58);
-            println!();
-
-            child_id += 1;
-            awarded_rows += 1;
-        }
-
-        if awarded_rows == 0 {
-            println!("No eligible collators for child-bounty awards after exclusions.");
-        } else {
-            println!(
-                "Planned {} child bounties from id {} to {} (inclusive).",
-                awarded_rows,
-                start_id,
-                child_id - 1
-            );
-            println!("\nNOTE: This is a logical plan only — you still need to encode these into");
-            println!("      actual SCALE RuntimeCall hex for the relevant relay chain.");
-        }
+    if response.trim().eq_ignore_ascii_case("y") {
+        save_to_csv(
+            &rows,
+            &chain,
+            year,
+            month as u8,
+            max_count,
+            ema,
+            &no_reward_set,
+        )?;
     }
 
     println!("\n==> Done.");
@@ -673,22 +677,6 @@ fn prompt_inputs() -> Result<Inputs> {
         }
     };
     Ok(Inputs { month, year, ema, fiat_opt })
-}
-
-fn prompt_child_bounty_start() -> Result<Option<u32>> {
-    println!("Enter the FIRST child bounty id to use (or just Enter to skip child-bounty planning):");
-    print!("First child bounty id: ");
-    io::stdout().flush().ok();
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    let t = s.trim();
-    if t.is_empty() {
-        Ok(None)
-    } else {
-        let id: u32 = t.parse()
-            .map_err(|e| anyhow!("invalid child bounty id '{t}': {e}"))?;
-        Ok(Some(id))
-    }
 }
 
 // ---------------- typed storage helpers ----------------
