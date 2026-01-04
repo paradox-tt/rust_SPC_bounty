@@ -227,14 +227,19 @@ fn save_to_csv(
     month: u8,
     max_count: usize,
     ema: f64,
+    staking_rate: f64,
     no_reward_set: &HashSet<&str>,
 ) -> Result<()> {
     // Determine relay chain
     let relay_chain = if chain.ss58 == 0 { "polkadot" } else { "kusama" };
 
-    // Create folder: output/{YYYY-MM}/{relay_chain}/
+    // Staking base amount (1000 DOT for Polkadot, 50 KSM for Kusama)
+    let staking_base = if chain.ss58 == 0 { 1000.0 } else { 50.0 };
+
+    // Create folder: ../SystemCollatorCSVFiles/{YYYY-MM}/{relay_chain}/
     let folder_name = format!("{:04}-{:02}", year, month);
-    let output_dir = PathBuf::from("../SystemCollatorCSVFiles")
+    let output_dir = PathBuf::from("..")
+        .join("SystemCollatorCSVFiles")
         .join(&folder_name)
         .join(relay_chain);
 
@@ -248,7 +253,7 @@ fn save_to_csv(
 
     // Build CSV
     let mut csv = String::new();
-    csv.push_str("address,identity,blocks,pct_total,pct_top,payout_usd,payout_tokens,skip_reason\n");
+    csv.push_str("address,identity,blocks,pct_total,pct_top,collator_reward_usd,collator_reward_tokens,staking_reward_tokens,total_tokens,skip_reason\n");
 
     for row in rows {
         if row.author_ss58 == "UNKNOWN" {
@@ -259,8 +264,16 @@ fn save_to_csv(
             (row.blocks as f64) * 100.0 / (max_count as f64)
         } else { 0.0 };
 
-        let payout_usd = 300.0 * (pct_top / 100.0);
-        let payout_tokens = payout_usd / ema;
+        // Collator reward (based on $300 pool)
+        let collator_reward_usd = 300.0 * (pct_top / 100.0);
+        let collator_reward_tokens = collator_reward_usd / ema;
+
+        // Staking reward: (staking_rate / 12 / 100 * base) * pct_top / 100
+        let monthly_staking_rate = staking_rate / 12.0 / 100.0;
+        let staking_reward_tokens = (monthly_staking_rate * staking_base) * (pct_top / 100.0);
+
+        // Total
+        let total_tokens = collator_reward_tokens + staking_reward_tokens;
 
         let identity = if row.identity.is_empty() {
             String::new()
@@ -275,14 +288,16 @@ fn save_to_csv(
         };
 
         csv.push_str(&format!(
-            "{},{},{},{:.4},{:.4},{:.2},{:.10},{}\n",
+            "{},{},{},{:.4},{:.4},{:.2},{:.4},{:.4},{:.4},{}\n",
             row.author_ss58,
             identity,
             row.blocks,
             row.pct_total,
             pct_top,
-            payout_usd,
-            payout_tokens,
+            collator_reward_usd,
+            collator_reward_tokens,
+            staking_reward_tokens,
+            total_tokens,
             skip_reason
         ));
     }
@@ -297,7 +312,7 @@ fn save_to_csv(
 #[tokio::main]
 async fn main() -> Result<()> {
     let chain = prompt_chain()?;
-    let Inputs { month, year, ema } = prompt_inputs()?;
+    let Inputs { month, year, ema, fiat_opt, staking_rate } = prompt_inputs()?;
 
     // identities
     let identity_maps = IdentityMaps::load().unwrap_or_else(|e| {
@@ -318,8 +333,9 @@ async fn main() -> Result<()> {
     let end_ms = end_dt.timestamp_millis() as u64;
 
     println!(
-        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}",
-        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema
+        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}{}",
+        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema,
+        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f / ema)).unwrap_or_default()
     );
 
     // connections
@@ -588,6 +604,7 @@ async fn main() -> Result<()> {
             month as u8,
             max_count,
             ema,
+            staking_rate,
             &no_reward_set,
         )?;
     }
@@ -597,7 +614,13 @@ async fn main() -> Result<()> {
 }
 
 // ---------------- interactive ----------------
-struct Inputs { month: u8, year: i32, ema: f64 }
+struct Inputs {
+    month: u8,
+    year: i32,
+    ema: f64,
+    fiat_opt: Option<f64>,
+    staking_rate: f64,
+}
 
 fn prompt_chain() -> Result<ChainCfg> {
     loop {
@@ -663,8 +686,29 @@ fn prompt_inputs() -> Result<Inputs> {
             _ => { eprintln!("  -> Please enter a positive number."); continue; }
         }
     };
-
-    Ok(Inputs { month, year, ema })
+    let staking_rate = loop {
+        print!("Enter annual staking rate % (e.g., 15.5 for 15.5%): ");
+        io::stdout().flush().ok();
+        let mut s = String::new();
+        io::stdin().read_line(&mut s)?;
+        match s.trim().parse::<f64>() {
+            Ok(v) if v >= 0.0 => break v,
+            _ => { eprintln!("  -> Please enter a non-negative number."); continue; }
+        }
+    };
+    let fiat_opt = loop {
+        print!("Enter fiat amount for example conversion (optional, press Enter to skip): ");
+        io::stdout().flush().ok();
+        let mut s = String::new();
+        io::stdin().read_line(&mut s)?;
+        let t = s.trim();
+        if t.is_empty() { break None; }
+        match t.parse::<f64>() {
+            Ok(v) if v >= 0.0 => break Some(v),
+            _ => { eprintln!("  -> Enter a non-negative number or just press Enter to skip."); continue; }
+        }
+    };
+    Ok(Inputs { month, year, ema, fiat_opt, staking_rate })
 }
 
 // ---------------- typed storage helpers ----------------
