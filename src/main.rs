@@ -26,8 +26,6 @@ pub mod ahp_polkadot {}
 pub mod ahp_kusama {}
 
 // Polkadot Bulletin chain
-// Generate metadata with:
-//   subxt metadata --url wss://rpc-bulletin.luckyfriday.io -f bytes > metadata/bulletin-polkadot.scale
 #[subxt::subxt(runtime_metadata_path = "metadata/bulletin-polkadot.scale")]
 pub mod bulletin_polkadot {}
 
