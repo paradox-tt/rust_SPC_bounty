@@ -25,6 +25,12 @@ pub mod ahp_polkadot {}
 #[subxt::subxt(runtime_metadata_path = "metadata/asset-hub-kusama.scale")]
 pub mod ahp_kusama {}
 
+// Polkadot Bulletin chain
+// Generate metadata with:
+//   subxt metadata --url wss://rpc-bulletin.luckyfriday.io -f bytes > metadata/bulletin-polkadot.scale
+#[subxt::subxt(runtime_metadata_path = "metadata/bulletin-polkadot.scale")]
+pub mod bulletin_polkadot {}
+
 #[subxt::subxt(runtime_metadata_path = "metadata/bridge-hub-polkadot.scale")]
 pub mod bridgehub_polkadot {}
 #[subxt::subxt(runtime_metadata_path = "metadata/coretime-polkadot.scale")]
@@ -59,6 +65,12 @@ const CHAINS: &[ChainCfg] = &[
     ChainCfg { name: "Polkadot Coretime",    ws: "wss://rpc-coretime-polkadot.luckyfriday.io",   ss58: 0, session_is_sr25519: true  },
     ChainCfg { name: "Polkadot Collectives", ws: "wss://rpc-collectives-polkadot.luckyfriday.io",ss58: 0, session_is_sr25519: true  },
     ChainCfg { name: "Polkadot People",      ws: "wss://rpc-people-polkadot.luckyfriday.io",     ss58: 0, session_is_sr25519: true  },
+    // Polkadot Bulletin chain (ss58 prefix 0; no validators excluded; no_reward list is empty)
+    // Collators matched to names via assets/bulletin-polkadot-identities.json:
+    //   Faraday Nodes  -> 155wHcqJ3fcfgtHsjqKHwNEU24pzRkkmZK865xxHeFTXMU8T  (aura: 0x4e91cfd5145fea6ebd1d1a441b33797e9c19918fa017291c73e56d2590566778)
+    //   yaron          -> 1sXuddoUew7f9F9XTVyns8KjCRRLvpvvUsZUyxZhqtH4RZn  (aura: 0x80d6667f725e501088c081ff924dbe1aa50c67618b0984cb996c3d5fa5500f0f)
+    //   DPSTK|dapestake-> 1A1WrKowzJD4yQQcETugEV5UWoNo1o7ujuA3f1fBfpxPjZL  (aura: 0x5e9659d151a03a5902e3135c9e361855f6d1caaea6e53a7d8613d7ad410bf507)
+    ChainCfg { name: "Polkadot Bulletin",    ws: "wss://rpc-bulletin.luckyfriday.io",             ss58: 0, session_is_sr25519: true  },
     // Kusama
     ChainCfg { name: "Kusama Asset Hub",     ws: "wss://rpc-asset-hub-kusama.luckyfriday.io",    ss58: 2, session_is_sr25519: true  },
     ChainCfg { name: "Kusama Bridge Hub",    ws: "wss://rpc-bridge-hub-kusama.luckyfriday.io",   ss58: 2, session_is_sr25519: true  },
@@ -131,6 +143,9 @@ struct IdentityMaps {
     // key: 42-prefix SS58, value: "Primary/Sub" or just "Primary"
     polkadot: HashMap<String, String>,
     kusama: HashMap<String, String>,
+    // Bulletin chain uses Polkadot SS58 prefix (0) but its own identity file,
+    // since it has no on-chain identity pallet — names are recorded manually.
+    bulletin: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -192,6 +207,33 @@ impl IdentityMaps {
             }
         }
 
+        // Polkadot Bulletin chain
+        // These identities are manually recorded — the Bulletin chain has no on-chain
+        // identity pallet.  Addresses are Polkadot SS58 (prefix 0) as shared by the
+        // collators themselves; they are stored here in generic 42-prefix form for
+        // consistent lookup.
+        match fs::read_to_string("assets/bulletin-polkadot-identities.json") {
+            Ok(s) => {
+                let list: Vec<IdentityJson> = serde_json::from_str(&s)
+                    .context("parse assets/bulletin-polkadot-identities.json")?;
+                for e in list {
+                    let display = if e.sub.trim().is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{}/{}", e.name, e.sub)
+                    };
+                    m.bulletin.insert(e.address, display);
+                }
+                eprintln!(
+                    "Loaded {} entries from assets/bulletin-polkadot-identities.json",
+                    m.bulletin.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("WARN: cannot read assets/bulletin-polkadot-identities.json: {e}");
+            }
+        }
+
         Ok(m)
     }
 
@@ -201,7 +243,9 @@ impl IdentityMaps {
         let generic_ss58 =
             sr25519::Public::from_raw(owner_raw).to_ss58check_with_version(generic_fmt);
 
-        let (which, map) = if chain.ss58 == 0 {
+        let (which, map) = if chain.name == "Polkadot Bulletin" {
+            ("Bulletin", &self.bulletin)
+        } else if chain.ss58 == 0 {
             ("Polkadot", &self.polkadot)
         } else {
             ("Kusama", &self.kusama)
@@ -231,9 +275,15 @@ fn save_to_csv(
     no_reward_set: &HashSet<&str>,
 ) -> Result<()> {
     // Determine relay chain
-    let relay_chain = if chain.ss58 == 0 { "polkadot" } else { "kusama" };
+    let relay_chain = if chain.name == "Polkadot Bulletin" {
+        "polkadot-bulletin"
+    } else if chain.ss58 == 0 {
+        "polkadot"
+    } else {
+        "kusama"
+    };
 
-    // Staking base amount (1000 DOT for Polkadot, 50 KSM for Kusama)
+    // Staking base amount (1000 DOT for Polkadot/Bulletin, 50 KSM for Kusama)
     let staking_base = if chain.ss58 == 0 { 1000.0 } else { 50.0 };
 
     // Create folder: ../SystemCollatorCSVFiles/{YYYY-MM}/{relay_chain}/
@@ -630,27 +680,29 @@ fn prompt_chain() -> Result<ChainCfg> {
         println!("  3) Polkadot  Coretime");
         println!("  4) Polkadot  Collectives");
         println!("  5) Polkadot  People");
-        println!("  6) Kusama    Asset Hub");
-        println!("  7) Kusama    Bridge Hub");
-        println!("  8) Kusama    Coretime");
-        println!("  9) Kusama    People");
-        println!(" 10) Kusama    Encointer");
-        print!("Enter selection (1-10): ");
+        println!("  6) Polkadot  Bulletin");
+        println!("  7) Kusama    Asset Hub");
+        println!("  8) Kusama    Bridge Hub");
+        println!("  9) Kusama    Coretime");
+        println!(" 10) Kusama    People");
+        println!(" 11) Kusama    Encointer");
+        print!("Enter selection (1-11): ");
         io::stdout().flush().ok();
         let mut s = String::new();
         io::stdin().read_line(&mut s)?;
         match s.trim() {
-            "1" => return Ok(CHAINS[0]),
-            "2" => return Ok(CHAINS[1]),
-            "3" => return Ok(CHAINS[2]),
-            "4" => return Ok(CHAINS[3]),
-            "5" => return Ok(CHAINS[4]),
-            "6" => return Ok(CHAINS[5]),
-            "7" => return Ok(CHAINS[6]),
-            "8" => return Ok(CHAINS[7]),
-            "9" => return Ok(CHAINS[8]),
+            "1"  => return Ok(CHAINS[0]),
+            "2"  => return Ok(CHAINS[1]),
+            "3"  => return Ok(CHAINS[2]),
+            "4"  => return Ok(CHAINS[3]),
+            "5"  => return Ok(CHAINS[4]),
+            "6"  => return Ok(CHAINS[5]),
+            "7"  => return Ok(CHAINS[6]),
+            "8"  => return Ok(CHAINS[7]),
+            "9"  => return Ok(CHAINS[8]),
             "10" => return Ok(CHAINS[9]),
-            _ => eprintln!("  -> Please enter 1..10."),
+            "11" => return Ok(CHAINS[10]),
+            _ => eprintln!("  -> Please enter 1..11."),
         }
     }
 }
@@ -732,6 +784,7 @@ async fn block_timestamp_typed(api: &OnlineClient<PolkadotConfig>, at: H256, cha
         "Polkadot Coretime"    => api.storage().at(at).fetch(&coretime_polkadot::storage().timestamp().now()).await?,
         "Polkadot Collectives" => api.storage().at(at).fetch(&collectives_polkadot::storage().timestamp().now()).await?,
         "Polkadot People"      => api.storage().at(at).fetch(&people_polkadot::storage().timestamp().now()).await?,
+        "Polkadot Bulletin"    => api.storage().at(at).fetch(&bulletin_polkadot::storage().timestamp().now()).await?,
         "Kusama Asset Hub"     => api.storage().at(at).fetch(&ahp_kusama::storage().timestamp().now()).await?,
         "Kusama Bridge Hub"    => api.storage().at(at).fetch(&bridgehub_kusama::storage().timestamp().now()).await?,
         "Kusama Coretime"      => api.storage().at(at).fetch(&coretime_kusama::storage().timestamp().now()).await?,
@@ -852,6 +905,16 @@ async fn derive_session_key_typed(
             > = api.storage().at(at).fetch(&people_polkadot::storage().aura().authorities()).await?;
             pick_key!(slot, auths)
         }
+        "Polkadot Bulletin" => {
+            let slot: Option<bulletin_polkadot::runtime_types::sp_consensus_slots::Slot> =
+                api.storage().at(at).fetch(&bulletin_polkadot::storage().aura().current_slot()).await?;
+            let auths: Option<
+                bulletin_polkadot::runtime_types::bounded_collections::bounded_vec::BoundedVec<
+                    bulletin_polkadot::runtime_types::sp_consensus_aura::sr25519::app_sr25519::Public
+                >
+            > = api.storage().at(at).fetch(&bulletin_polkadot::storage().aura().authorities()).await?;
+            pick_key!(slot, auths)
+        }
         // Kusama
         "Kusama Asset Hub" => {
             let slot: Option<ahp_kusama::runtime_types::sp_consensus_slots::Slot> =
@@ -949,6 +1012,11 @@ async fn session_key_owner_account_typed(
         "Polkadot People" => {
             let kt = people_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
             let call = people_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
+            fetch_owner!(call)
+        }
+        "Polkadot Bulletin" => {
+            let kt = bulletin_polkadot::runtime_types::sp_core::crypto::KeyTypeId(aura);
+            let call = bulletin_polkadot::storage().session().key_owner((kt, session_key_raw32.to_vec()));
             fetch_owner!(call)
         }
         // Kusama
