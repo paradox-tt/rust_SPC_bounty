@@ -1,0 +1,20 @@
+[
+    {
+        "address": "5G9e9HaEBtMCFMHMnCGHoDQKASqLjTCdUpPbvfxw6AS1Apff",
+        "name": "Faraday Nodes",
+        "sub": "",
+        "note": "Polkadot address: 155wHcqJ3fcfgtHsjqKHwNEU24pzRkkmZK865xxHeFTXMU8T | aura key: 0x4e91cfd5145fea6ebd1d1a441b33797e9c19918fa017291c73e56d2590566778 | peer id: 12D3KooWNy2J75qK8C4o8ooFHpLY4rPPsZcR8qNjgDuW2tvCqEWG"
+    },
+    {
+        "address": "5CwEmJNjcsfeDcEdZpSyeiJAsaRmedGnqz95KgyD9krkt2wj",
+        "name": "yaron",
+        "sub": "",
+        "note": "Polkadot address: 1sXuddoUew7f9F9XTVyns8KjCRRLvpvvUsZUyxZhqtH4RZn | aura key: 0x80d6667f725e501088c081ff924dbe1aa50c67618b0984cb996c3d5fa5500f0f | peer id: 12D3KooWMc7ZJ6JGiehG1H45JL69QTPivEBnzm8LihkEEFjYMRnr"
+    },
+    {
+        "address": "5CDiNX4k6D2jdSPtebQuY5evctoj6iEyqFAftN2JdaoSDa8R",
+        "name": "DPSTK | dapestake",
+        "sub": "",
+        "note": "Polkadot address: 1A1WrKowzJD4yQQcETugEV5UWoNo1o7ujuA3f1fBfpxPjZL | aura key: 0x5e9659d151a03a5902e3135c9e361855f6d1caaea6e53a7d8613d7ad410bf507 | peer id: 12D3KooWHPmACsPbXDo9n4qjBZqGEqJ7JLG2fvaCWNCMWyysg6vQ"
+    }
+]
