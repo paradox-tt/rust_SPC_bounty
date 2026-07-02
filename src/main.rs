@@ -58,7 +58,7 @@ struct ChainCfg {
 
 const CHAINS: &[ChainCfg] = &[
     // Polkadot
-    ChainCfg { name: "Polkadot Asset Hub",   ws: "wss://asset-hub-polkadot.dotters.network",  ss58: 0, session_is_sr25519: false },
+    ChainCfg { name: "Polkadot Asset Hub",   ws: "wss://rpc-asset-hub-polkadot.luckyfriday.io",  ss58: 0, session_is_sr25519: false },
     ChainCfg { name: "Polkadot Bridge Hub",  ws: "wss://rpc-bridge-hub-polkadot.luckyfriday.io", ss58: 0, session_is_sr25519: true  },
     ChainCfg { name: "Polkadot Coretime",    ws: "wss://rpc-coretime-polkadot.luckyfriday.io",   ss58: 0, session_is_sr25519: true  },
     ChainCfg { name: "Polkadot Collectives", ws: "wss://rpc-collectives-polkadot.luckyfriday.io",ss58: 0, session_is_sr25519: true  },
