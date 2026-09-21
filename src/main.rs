@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use parity_scale_codec::{Decode, Encode};
 use subxt::{OnlineClient, PolkadotConfig};
 use tokio::sync::Mutex;
 
@@ -417,6 +418,18 @@ async fn main() -> Result<()> {
     println!("   -> last in window:  #{}", last_num);
     if last_num < first_num { bail!("Empty window: last({last_num}) < first({first_num})."); }
 
+    // Invulnerable collator set (CollatorSelection::Invulnerables), read at the last block of the window.
+    let last_hash = block_hash_by_number(&rpc, last_num).await?;
+    let invulnerables: Arc<HashSet<[u8; 32]>> =
+        Arc::new(fetch_invulnerables_typed(&api, last_hash, chain).await?);
+    if invulnerables.is_empty() {
+        bail!("CollatorSelection::Invulnerables is empty/unset on {} at block #{}.", chain.name, last_num);
+    }
+    println!("==> Invulnerable collators at #{}: {}", last_num, invulnerables.len());
+    for raw in invulnerables.iter() {
+        println!("   - {}", ss58_from_raw32_with_prefix(*raw, chain.ss58));
+    }
+
     let total_blocks = (last_num - first_num + 1) as usize;
     println!(
         "==> Full scan: total blocks = {total_blocks}, chunk size = {CHUNK_SIZE}, outer chunk concurrency = {CHUNK_CONCURRENCY}, inner per-chunk concurrency = {CONCURRENCY}"
@@ -452,6 +465,7 @@ async fn main() -> Result<()> {
     let stats: Arc<Mutex<HashMap<[u8; 32], usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let unknowns = Arc::new(Mutex::new(0usize));
     let block_errors = Arc::new(Mutex::new(0usize));
+    let skipped_non_invulnerable = Arc::new(Mutex::new(0usize));
 
     // run
     futures::stream::iter(
@@ -465,6 +479,8 @@ async fn main() -> Result<()> {
                 let pb_for_tasks = chunk_pb.clone();
                 let unknowns = unknowns.clone();
                 let block_errors = block_errors.clone();
+                let invulnerables = invulnerables.clone();
+                let skipped_non_invulnerable = skipped_non_invulnerable.clone();
                 let chain = chain;
 
                 async move {
@@ -478,6 +494,8 @@ async fn main() -> Result<()> {
                         let overall_pb = overall_pb.clone();
                         let unknowns = unknowns.clone();
                         let block_errors = block_errors.clone();
+                        let invulnerables = invulnerables.clone();
+                        let skipped_non_invulnerable = skipped_non_invulnerable.clone();
                         let chain = chain;
 
                         async move {
@@ -490,8 +508,14 @@ async fn main() -> Result<()> {
                                 // 2) resolve owner via Session::KeyOwner((KeyTypeId("aura"), key_bytes))
                                 if let Some(sess_key) = session_key_opt {
                                     if let Some(owner_raw) = session_key_owner_account_typed(&api, h, chain, sess_key).await? {
-                                        let mut sm = stats.lock().await;
-                                        *sm.entry(owner_raw).or_insert(0) += 1;
+                                        // 3) only count blocks authored by invulnerable collators
+                                        if invulnerables.contains(&owner_raw) {
+                                            let mut sm = stats.lock().await;
+                                            *sm.entry(owner_raw).or_insert(0) += 1;
+                                        } else {
+                                            let mut sk = skipped_non_invulnerable.lock().await;
+                                            *sk += 1;
+                                        }
                                     } else {
                                         let mut u = unknowns.lock().await;
                                         *u += 1;
@@ -545,6 +569,7 @@ async fn main() -> Result<()> {
 
     // summary
     let stats = Arc::try_unwrap(stats).unwrap().into_inner();
+    let skipped_non_invulnerable = Arc::try_unwrap(skipped_non_invulnerable).unwrap().into_inner();
     let total_scanned: usize = stats.values().copied().sum();
 
     // Build NO_REWARD set for quick membership test
@@ -599,7 +624,8 @@ async fn main() -> Result<()> {
     println!("Chain:      {}", chain.name);
     println!("Chain RPC:  {}", chain.ws);
     println!("Window:     [{} .. {})", start_dt.to_rfc3339(), end_dt.to_rfc3339());
-    println!("Blocks scanned: {}", total_scanned);
+    println!("Blocks counted (invulnerables + unresolved): {}", total_scanned);
+    println!("Blocks skipped (non-invulnerable authors):   {}", skipped_non_invulnerable);
     println!(
         "{:<6}  {:<48}  {:<28}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}",
         "Rank", "Author (Owner SS58)", "Identity", "Blocks", "%", "%Top", "Payout", "Payout/EMA"
@@ -627,14 +653,17 @@ async fn main() -> Result<()> {
         );
     }
     println!("{}", "-".repeat(140));
-    println!("Note: '%' is share of all blocks in window; '%Top' is relative to the top producer.");
+    println!("Note: '%' is share of counted (invulnerable) blocks in window; '%Top' is relative to the top producer.");
     println!("Assumed reward pool for '%Top' payout: ${:.2}", REWARD_USD);
     println!("EMA used: {}", ema);
 
     // diagnostics
     let unknowns = Arc::try_unwrap(unknowns).unwrap().into_inner();
     let block_errors = Arc::try_unwrap(block_errors).unwrap().into_inner();
-    eprintln!("Diagnostics: unknown-authors={}, block-errors={}", unknowns, block_errors);
+    eprintln!(
+        "Diagnostics: unknown-authors={}, block-errors={}, non-invulnerable-blocks-skipped={}",
+        unknowns, block_errors, skipped_non_invulnerable
+    );
 
     // Prompt and save CSV
     println!("\n{}", "=".repeat(80));
@@ -968,6 +997,45 @@ async fn derive_session_key_typed(
     };
 
     Ok(key_opt)
+}
+
+/// Fetch CollatorSelection::Invulnerables at `at` as a set of raw AccountId32s.
+/// The value is SCALE-encoded and re-decoded as Vec<[u8;32]> so this works regardless of
+/// whether a chain's metadata types it as Vec or BoundedVec.
+async fn fetch_invulnerables_typed(
+    api: &OnlineClient<PolkadotConfig>,
+    at: H256,
+    chain: ChainCfg,
+) -> Result<HashSet<[u8; 32]>> {
+    macro_rules! fetch_inv {
+        ($m:ident) => {{
+            let addr = $m::storage().collator_selection().invulnerables();
+            let v = api.storage().at(at).fetch(&addr).await?;
+            v.map(|x| x.encode())
+        }};
+    }
+
+    let encoded: Option<Vec<u8>> = match chain.name {
+        // Polkadot
+        "Polkadot Asset Hub" => fetch_inv!(ahp_polkadot),
+        "Polkadot Bridge Hub" => fetch_inv!(bridgehub_polkadot),
+        "Polkadot Coretime" => fetch_inv!(coretime_polkadot),
+        "Polkadot Collectives" => fetch_inv!(collectives_polkadot),
+        "Polkadot People" => fetch_inv!(people_polkadot),
+        "Polkadot Bulletin" => fetch_inv!(bulletin_polkadot),
+        // Kusama
+        "Kusama Asset Hub" => fetch_inv!(ahp_kusama),
+        "Kusama Bridge Hub" => fetch_inv!(bridgehub_kusama),
+        "Kusama Coretime" => fetch_inv!(coretime_kusama),
+        "Kusama People" => fetch_inv!(people_kusama),
+        "Kusama Encointer" => fetch_inv!(encointer_kusama),
+        _ => None,
+    };
+
+    let Some(bytes) = encoded else { return Ok(HashSet::new()); };
+    let accounts = Vec::<[u8; 32]>::decode(&mut &bytes[..])
+        .map_err(|e| anyhow!("decode Invulnerables failed: {e}"))?;
+    Ok(accounts.into_iter().collect())
 }
 
 async fn session_key_owner_account_typed(
