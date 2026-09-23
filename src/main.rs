@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use parity_scale_codec::{Decode, Encode};
 use subxt::{OnlineClient, PolkadotConfig};
 use tokio::sync::Mutex;
 
@@ -1007,15 +1006,19 @@ async fn fetch_invulnerables_typed(
     at: H256,
     chain: ChainCfg,
 ) -> Result<HashSet<[u8; 32]>> {
+    // Mirrors how `authorities()` is unwrapped elsewhere in this file (`let v = bv.0;`):
+    // pull the inner Vec<T> straight out of the generated BoundedVec rather than
+    // re-encoding/decoding the whole collection (which trips over duplicate
+    // parity-scale-codec versions between this crate and subxt's bundled copy).
     macro_rules! fetch_inv {
         ($m:ident) => {{
             let addr = $m::storage().collator_selection().invulnerables();
             let v = api.storage().at(at).fetch(&addr).await?;
-            v.map(|x| x.encode())
+            v.map(|bv| bv.0.into_iter().map(account_to_raw32).collect::<Vec<[u8; 32]>>())
         }};
     }
 
-    let encoded: Option<Vec<u8>> = match chain.name {
+    let accounts: Option<Vec<[u8; 32]>> = match chain.name {
         // Polkadot
         "Polkadot Asset Hub" => fetch_inv!(ahp_polkadot),
         "Polkadot Bridge Hub" => fetch_inv!(bridgehub_polkadot),
@@ -1032,10 +1035,7 @@ async fn fetch_invulnerables_typed(
         _ => None,
     };
 
-    let Some(bytes) = encoded else { return Ok(HashSet::new()); };
-    let accounts = Vec::<[u8; 32]>::decode(&mut &bytes[..])
-        .map_err(|e| anyhow!("decode Invulnerables failed: {e}"))?;
-    Ok(accounts.into_iter().collect())
+    Ok(accounts.unwrap_or_default().into_iter().collect())
 }
 
 async fn session_key_owner_account_typed(
@@ -1116,7 +1116,7 @@ async fn session_key_owner_account_typed(
 }
 
 /// Convert a runtime AccountId32 (opaque newtype) into [u8;32] by SCALE-encoding then truncating.
-fn account_to_raw32<T: parity_scale_codec::Encode>(acc: T) -> [u8; 32] {
+fn account_to_raw32<T: subxt::ext::codec::Encode>(acc: T) -> [u8; 32] {
     let bytes = acc.encode();
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes[..32]);
