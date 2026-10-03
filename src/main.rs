@@ -78,7 +78,21 @@ const CHAINS: &[ChainCfg] = &[
 ];
 
 // ---------------- knobs ----------------
-const REWARD_USD: f64 = 300.0;
+// Keep these in sync with COLLATOR_REWARD_USD / BULLETIN_COLLATOR_REWARD_USD in the
+// TypeScript payout script (index.ts). The TS script recomputes the payout from
+// pct_top itself; the CSV's collator_reward_usd column is informational.
+const COLLATOR_REWARD_USD: f64 = 250.0;
+const BULLETIN_COLLATOR_REWARD_USD: f64 = 500.0;
+
+fn is_bulletin(chain: &ChainCfg) -> bool {
+    chain.name == "Polkadot Bulletin"
+}
+
+/// Maximum USD reward per collator for this chain (paid in full to the top producer)
+fn reward_cap_usd(chain: &ChainCfg) -> f64 {
+    if is_bulletin(chain) { BULLETIN_COLLATOR_REWARD_USD } else { COLLATOR_REWARD_USD }
+}
+
 const CHUNK_SIZE: usize = 10_000;
 const CONCURRENCY: usize = 32;
 const CHUNK_CONCURRENCY: usize = 20;
@@ -261,30 +275,23 @@ impl IdentityMaps {
 
 // ---------------- CSV saving ----------------
 
-/// Save collator data to CSV with organized folder structure
+/// Save collator data to CSV in the layout the TypeScript payout script reads:
+///   ../SystemCollatorCSVFiles/{YYYY-MM}/{polkadot|kusama}/{chain_name}.csv
+/// Bulletin goes in the `polkadot` folder as `polkadot_bulletin.csv`; the TS script
+/// recognises it by "bulletin" in the file name and applies the $500 rate.
+///
+/// Columns: address,identity,blocks,pct_total,pct_top,collator_reward_usd,skip_reason
 fn save_to_csv(
     rows: &[Row],
     chain: &ChainCfg,
     year: i32,
     month: u8,
     max_count: usize,
-    ema: f64,
-    staking_rate: f64,
     no_reward_set: &HashSet<&str>,
 ) -> Result<()> {
-    // Determine relay chain
-    let relay_chain = if chain.name == "Polkadot Bulletin" {
-        "polkadot-bulletin"
-    } else if chain.ss58 == 0 {
-        "polkadot"
-    } else {
-        "kusama"
-    };
+    // Relay chain folder (Bulletin is a Polkadot chain and is paid from the Polkadot bounty)
+    let relay_chain = if chain.ss58 == 0 { "polkadot" } else { "kusama" };
 
-    // Staking base amount (1000 DOT for Polkadot/Bulletin, 50 KSM for Kusama)
-    let staking_base = if chain.ss58 == 0 { 1000.0 } else { 50.0 };
-
-    // Create folder: ../SystemCollatorCSVFiles/{YYYY-MM}/{relay_chain}/
     let folder_name = format!("{:04}-{:02}", year, month);
     let output_dir = PathBuf::from("..")
         .join("SystemCollatorCSVFiles")
@@ -293,15 +300,14 @@ fn save_to_csv(
 
     std::fs::create_dir_all(&output_dir)?;
 
-    // Filename: sanitized chain name
-    let chain_name_sanitized = chain.name
-        .replace(" ", "_")
-        .to_lowercase();
+    // Filename: sanitized chain name, e.g. polkadot_asset_hub.csv, polkadot_bulletin.csv
+    let chain_name_sanitized = chain.name.replace(' ', "_").to_lowercase();
     let csv_path = output_dir.join(format!("{}.csv", chain_name_sanitized));
 
-    // Build CSV
+    let cap = reward_cap_usd(chain);
+
     let mut csv = String::new();
-    csv.push_str("address,identity,blocks,pct_total,pct_top,collator_reward_usd,collator_reward_tokens,staking_reward_tokens,total_tokens,skip_reason\n");
+    csv.push_str("address,identity,blocks,pct_total,pct_top,collator_reward_usd,skip_reason\n");
 
     for row in rows {
         if row.author_ss58 == "UNKNOWN" {
@@ -312,21 +318,13 @@ fn save_to_csv(
             (row.blocks as f64) * 100.0 / (max_count as f64)
         } else { 0.0 };
 
-        // Collator reward (based on $300 pool)
-        let collator_reward_usd = 300.0 * (pct_top / 100.0);
-        let collator_reward_tokens = collator_reward_usd / ema;
-
-        // Staking reward: (staking_rate / 12 / 100 * base) * pct_top / 100
-        let monthly_staking_rate = staking_rate / 12.0 / 100.0;
-        let staking_reward_tokens = (monthly_staking_rate * staking_base) * (pct_top / 100.0);
-
-        // Total
-        let total_tokens = collator_reward_tokens + staking_reward_tokens;
+        // Informational only - the TS script computes the actual payout
+        let collator_reward_usd = cap * (pct_top / 100.0);
 
         let identity = if row.identity.is_empty() {
             String::new()
         } else {
-            format!("\"{}\"", row.identity.replace("\"", "\"\""))
+            format!("\"{}\"", row.identity.replace('"', "\"\""))
         };
 
         let skip_reason = if no_reward_set.contains(row.author_ss58.as_str()) {
@@ -336,16 +334,13 @@ fn save_to_csv(
         };
 
         csv.push_str(&format!(
-            "{},{},{},{:.4},{:.4},{:.2},{:.4},{:.4},{:.4},{}\n",
+            "{},{},{},{:.4},{:.4},{:.2},{}\n",
             row.author_ss58,
             identity,
             row.blocks,
             row.pct_total,
             pct_top,
             collator_reward_usd,
-            collator_reward_tokens,
-            staking_reward_tokens,
-            total_tokens,
             skip_reason
         ));
     }
@@ -360,7 +355,7 @@ fn save_to_csv(
 #[tokio::main]
 async fn main() -> Result<()> {
     let chain = prompt_chain()?;
-    let Inputs { month, year, ema, fiat_opt, staking_rate } = prompt_inputs()?;
+    let Inputs { year, month } = prompt_inputs()?;
 
     // identities
     let identity_maps = IdentityMaps::load().unwrap_or_else(|e| {
@@ -381,9 +376,8 @@ async fn main() -> Result<()> {
     let end_ms = end_dt.timestamp_millis() as u64;
 
     println!(
-        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  EMA: {}{}",
-        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), ema,
-        fiat_opt.map(|f| format!("  |  Example: ${:.2} ⇒ {:.8} units", f, f / ema)).unwrap_or_default()
+        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  Reward cap: ${:.2}",
+        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), reward_cap_usd(&chain)
     );
 
     // connections
@@ -417,17 +411,12 @@ async fn main() -> Result<()> {
     println!("   -> last in window:  #{}", last_num);
     if last_num < first_num { bail!("Empty window: last({last_num}) < first({first_num})."); }
 
-    // Invulnerable collator set (CollatorSelection::Invulnerables), read at the last block of the window.
-    let last_hash = block_hash_by_number(&rpc, last_num).await?;
-    let invulnerables: Arc<HashSet<[u8; 32]>> =
-        Arc::new(fetch_invulnerables_typed(&api, last_hash, chain).await?);
-    if invulnerables.is_empty() {
-        bail!("CollatorSelection::Invulnerables is empty/unset on {} at block #{}.", chain.name, last_num);
-    }
-    println!("==> Invulnerable collators at #{}: {}", last_num, invulnerables.len());
-    for raw in invulnerables.iter() {
-        println!("   - {}", ss58_from_raw32_with_prefix(*raw, chain.ss58));
-    }
+    // Invulnerables can change during the month (added/removed at any block), so the set is
+    // read at EVERY block. A block counts only if its author was invulnerable at that block,
+    // and every account that was invulnerable at any point is collected here with the first
+    // and last block it was seen, so the report/CSV shows all of them for the whole month.
+    let inv_seen: Arc<Mutex<HashMap<[u8; 32], (u32, u32)>>> = Arc::new(Mutex::new(HashMap::new()));
+    println!("==> Invulnerables are read per block (set may change during the window)");
 
     let total_blocks = (last_num - first_num + 1) as usize;
     println!(
@@ -478,7 +467,7 @@ async fn main() -> Result<()> {
                 let pb_for_tasks = chunk_pb.clone();
                 let unknowns = unknowns.clone();
                 let block_errors = block_errors.clone();
-                let invulnerables = invulnerables.clone();
+                let inv_seen = inv_seen.clone();
                 let skipped_non_invulnerable = skipped_non_invulnerable.clone();
                 let chain = chain;
 
@@ -493,7 +482,7 @@ async fn main() -> Result<()> {
                         let overall_pb = overall_pb.clone();
                         let unknowns = unknowns.clone();
                         let block_errors = block_errors.clone();
-                        let invulnerables = invulnerables.clone();
+                        let inv_seen = inv_seen.clone();
                         let skipped_non_invulnerable = skipped_non_invulnerable.clone();
                         let chain = chain;
 
@@ -501,13 +490,28 @@ async fn main() -> Result<()> {
                             let res: Result<()> = async {
                                 let h = block_hash_by_number(&rpc, n).await?;
 
-                                // 1) derive aura session key (slot % authorities) via typed storage
-                                let session_key_opt = derive_session_key_typed(&api, h, chain).await?;
+                                // 1) derive aura session key (slot % authorities) and read the
+                                //    invulnerable set as it was at THIS block (in parallel)
+                                let (session_key_opt, invulnerables) = tokio::try_join!(
+                                    derive_session_key_typed(&api, h, chain),
+                                    fetch_invulnerables_typed(&api, h, chain),
+                                )?;
+
+                                // record every invulnerable seen, with first/last block
+                                {
+                                    let mut seen = inv_seen.lock().await;
+                                    for raw in invulnerables.iter() {
+                                        let e = seen.entry(*raw).or_insert((n, n));
+                                        if n < e.0 { e.0 = n; }
+                                        if n > e.1 { e.1 = n; }
+                                    }
+                                }
 
                                 // 2) resolve owner via Session::KeyOwner((KeyTypeId("aura"), key_bytes))
                                 if let Some(sess_key) = session_key_opt {
                                     if let Some(owner_raw) = session_key_owner_account_typed(&api, h, chain, sess_key).await? {
-                                        // 3) only count blocks authored by invulnerable collators
+                                        // 3) only count blocks authored by a collator that was
+                                        //    invulnerable at this block
                                         if invulnerables.contains(&owner_raw) {
                                             let mut sm = stats.lock().await;
                                             *sm.entry(owner_raw).or_insert(0) += 1;
@@ -574,6 +578,17 @@ async fn main() -> Result<()> {
     // Build NO_REWARD set for quick membership test
     let no_reward_set: HashSet<&'static str> = NO_REWARD_COLLATORS.iter().copied().collect();
 
+    let inv_seen = Arc::try_unwrap(inv_seen).unwrap().into_inner();
+    if inv_seen.is_empty() {
+        bail!("CollatorSelection::Invulnerables was empty/unset on {} for the whole window.", chain.name);
+    }
+
+    // Every invulnerable from the month gets a row, even with 0 blocks
+    let mut stats = stats;
+    for raw in inv_seen.keys() {
+        stats.entry(*raw).or_insert(0);
+    }
+
     let mut rows: Vec<Row> = stats
         .into_iter()
         .map(|(owner_raw, cnt)| {
@@ -617,7 +632,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    let max_count = rows.iter().map(|r| r.blocks).max().unwrap_or(0);
+    // Top producer among real collators (UNKNOWN must not set the 100% mark)
+    let max_count = rows
+        .iter()
+        .filter(|r| r.author_ss58 != "UNKNOWN")
+        .map(|r| r.blocks)
+        .max()
+        .unwrap_or(0);
+    let cap = reward_cap_usd(&chain);
 
     println!("\n================ SUMMARY (full scan) ================");
     println!("Chain:      {}", chain.name);
@@ -626,8 +648,8 @@ async fn main() -> Result<()> {
     println!("Blocks counted (invulnerables + unresolved): {}", total_scanned);
     println!("Blocks skipped (non-invulnerable authors):   {}", skipped_non_invulnerable);
     println!(
-        "{:<6}  {:<48}  {:<28}  {:>8}  {:>7}  {:>7}  {:>9}  {:>11}",
-        "Rank", "Author (Owner SS58)", "Identity", "Blocks", "%", "%Top", "Payout", "Payout/EMA"
+        "{:<6}  {:<48}  {:<28}  {:>8}  {:>7}  {:>7}  {:>9}",
+        "Rank", "Author (Owner SS58)", "Identity", "Blocks", "%", "%Top", "Payout $"
     );
     println!("{}", "-".repeat(140));
 
@@ -635,26 +657,34 @@ async fn main() -> Result<()> {
         let pct_top = if max_count > 0 {
             (row.blocks as f64) * 100.0 / (max_count as f64)
         } else { 0.0 };
-        let payout = REWARD_USD * (pct_top / 100.0);
-        let payout_per_ema = payout / ema;
+        let payout = if row.author_ss58 == "UNKNOWN" { 0.0 } else { cap * (pct_top / 100.0) };
         let id_display = if row.identity.is_empty() { "-".to_string() } else { row.identity.clone() };
 
         println!(
-            "{:<6}  {:<48}  {:<28}  {:>8}  {:>7.2}  {:>7.2}  {:>9.2}  {:>11.6}",
+            "{:<6}  {:<48}  {:<28}  {:>8}  {:>7.2}  {:>7.2}  {:>9.2}",
             i + 1,
             row.author_ss58,
             id_display,
             row.blocks,
             row.pct_total,
             pct_top,
-            payout,
-            payout_per_ema
+            payout
         );
     }
     println!("{}", "-".repeat(140));
     println!("Note: '%' is share of counted (invulnerable) blocks in window; '%Top' is relative to the top producer.");
-    println!("Assumed reward pool for '%Top' payout: ${:.2}", REWARD_USD);
-    println!("EMA used: {}", ema);
+    println!("Reward cap for '%Top' payout: ${:.2} (paid in USDT on Polkadot, converted to KSM by the payout script on Kusama)", cap);
+
+    // All invulnerables seen during the window, with the block range they were seen in
+    let mut inv_list: Vec<(&[u8; 32], &(u32, u32))> = inv_seen.iter().collect();
+    inv_list.sort_by_key(|(_, (first, _))| *first);
+    println!("\nInvulnerables during the window: {}", inv_list.len());
+    for (raw, (first, last)) in inv_list {
+        let ss58 = ss58_from_raw32_with_prefix(*raw, chain.ss58);
+        let id = identity_maps.lookup(&chain, *raw).unwrap_or_else(|| "-".to_string());
+        let note = if *first == first_num && *last == last_num { "whole window" } else { "changed during window" };
+        println!("   - {:<48}  {:<28}  #{} .. #{}  ({})", ss58, id, first, last, note);
+    }
 
     // diagnostics
     let unknowns = Arc::try_unwrap(unknowns).unwrap().into_inner();
@@ -679,8 +709,6 @@ async fn main() -> Result<()> {
             year,
             month as u8,
             max_count,
-            ema,
-            staking_rate,
             &no_reward_set,
         )?;
     }
@@ -690,12 +718,11 @@ async fn main() -> Result<()> {
 }
 
 // ---------------- interactive ----------------
+// Only the chain, year and month are needed. No EMA / staking rate: payouts are in USD
+// (USDT on Polkadot); the TS payout script asks for the KSM price when paying Kusama.
 struct Inputs {
-    month: u8,
     year: i32,
-    ema: f64,
-    fiat_opt: Option<f64>,
-    staking_rate: f64,
+    month: u8,
 }
 
 fn prompt_chain() -> Result<ChainCfg> {
@@ -734,16 +761,7 @@ fn prompt_chain() -> Result<ChainCfg> {
 }
 
 fn prompt_inputs() -> Result<Inputs> {
-    let month = loop {
-        print!("Enter month (1-12): ");
-        io::stdout().flush().ok();
-        let mut s = String::new();
-        io::stdin().read_line(&mut s)?;
-        match s.trim().parse::<u8>() {
-            Ok(m) if (1..=12).contains(&m) => break m,
-            _ => { eprintln!("  -> Please enter an integer 1..12."); continue; }
-        }
-    };
+    // Same order as the TypeScript payout script: year, then month
     let year = loop {
         print!("Enter year (>= 2024): ");
         io::stdout().flush().ok();
@@ -754,39 +772,17 @@ fn prompt_inputs() -> Result<Inputs> {
             _ => { eprintln!("  -> Please enter a valid year >= 2024."); continue; }
         }
     };
-    let ema = loop {
-        print!("Enter EMA (> 0): ");
+    let month = loop {
+        print!("Enter month (1-12): ");
         io::stdout().flush().ok();
         let mut s = String::new();
         io::stdin().read_line(&mut s)?;
-        match s.trim().parse::<f64>() {
-            Ok(v) if v > 0.0 => break v,
-            _ => { eprintln!("  -> Please enter a positive number."); continue; }
+        match s.trim().parse::<u8>() {
+            Ok(m) if (1..=12).contains(&m) => break m,
+            _ => { eprintln!("  -> Please enter an integer 1..12."); continue; }
         }
     };
-    let staking_rate = loop {
-        print!("Enter annual staking rate % (e.g., 15.5 for 15.5%): ");
-        io::stdout().flush().ok();
-        let mut s = String::new();
-        io::stdin().read_line(&mut s)?;
-        match s.trim().parse::<f64>() {
-            Ok(v) if v >= 0.0 => break v,
-            _ => { eprintln!("  -> Please enter a non-negative number."); continue; }
-        }
-    };
-    let fiat_opt = loop {
-        print!("Enter fiat amount for example conversion (optional, press Enter to skip): ");
-        io::stdout().flush().ok();
-        let mut s = String::new();
-        io::stdin().read_line(&mut s)?;
-        let t = s.trim();
-        if t.is_empty() { break None; }
-        match t.parse::<f64>() {
-            Ok(v) if v >= 0.0 => break Some(v),
-            _ => { eprintln!("  -> Enter a non-negative number or just press Enter to skip."); continue; }
-        }
-    };
-    Ok(Inputs { month, year, ema, fiat_opt, staking_rate })
+    Ok(Inputs { year, month })
 }
 
 // ---------------- typed storage helpers ----------------
