@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 use subxt::{OnlineClient, PolkadotConfig};
@@ -50,31 +51,34 @@ pub mod encointer_kusama {}
 #[derive(Clone, Copy, Debug)]
 struct ChainCfg {
     name: &'static str,
-    ws:   &'static str,
+    // RPC endpoints in order of preference. If a call fails (connection drop, timeout,
+    // pruned state...) the same call is retried on the next endpoint.
+    rpcs: &'static [&'static str],
     ss58: u16,       // network prefix for AccountId SS58 (0 for DOT, 2 for KSM)
     // true = aura session key is sr25519; false = ed25519 (only used for debugging session key, if needed)
     session_is_sr25519: bool,
 }
 
 const CHAINS: &[ChainCfg] = &[
-    // Polkadot
-    ChainCfg { name: "Polkadot Asset Hub",   ws: "wss://rpc-asset-hub-polkadot.luckyfriday.io",  ss58: 0, session_is_sr25519: false },
-    ChainCfg { name: "Polkadot Bridge Hub",  ws: "wss://rpc-bridge-hub-polkadot.luckyfriday.io", ss58: 0, session_is_sr25519: true  },
-    ChainCfg { name: "Polkadot Coretime",    ws: "wss://rpc-coretime-polkadot.luckyfriday.io",   ss58: 0, session_is_sr25519: true  },
-    ChainCfg { name: "Polkadot Collectives", ws: "wss://rpc-collectives-polkadot.luckyfriday.io",ss58: 0, session_is_sr25519: true  },
-    ChainCfg { name: "Polkadot People",      ws: "wss://rpc-people-polkadot.luckyfriday.io",     ss58: 0, session_is_sr25519: true  },
+    // Polkadot (internal nodes; ws:// because they're on the LAN, no TLS)
+    ChainCfg { name: "Polkadot Asset Hub",   rpcs: &["ws://192.168.250.179:9944", "ws://192.168.250.226:9944"], ss58: 0, session_is_sr25519: false },
+    ChainCfg { name: "Polkadot Bridge Hub",  rpcs: &["ws://192.168.250.180:9944", "ws://192.168.250.227:9944"], ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot Coretime",    rpcs: &["ws://192.168.250.220:9944", "ws://192.168.250.230:9944"], ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot Collectives", rpcs: &["ws://192.168.250.181:9944", "ws://192.168.250.228:9944"], ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot People",      rpcs: &["ws://192.168.250.219:9944", "ws://192.168.250.229:9944"], ss58: 0, session_is_sr25519: true  },
     // Polkadot Bulletin chain (ss58 prefix 0; no validators excluded; no_reward list is empty)
+    // No internal node yet - public ARCHIVE endpoint (LuckyFriday's Bulletin RPC is pruned).
     // Collators matched to names via assets/bulletin-polkadot-identities.json:
     //   Faraday Nodes  -> 155wHcqJ3fcfgtHsjqKHwNEU24pzRkkmZK865xxHeFTXMU8T  (aura: 0x4e91cfd5145fea6ebd1d1a441b33797e9c19918fa017291c73e56d2590566778)
     //   yaron          -> 1sXuddoUew7f9F9XTVyns8KjCRRLvpvvUsZUyxZhqtH4RZn  (aura: 0x80d6667f725e501088c081ff924dbe1aa50c67618b0984cb996c3d5fa5500f0f)
     //   DPSTK|dapestake-> 1A1WrKowzJD4yQQcETugEV5UWoNo1o7ujuA3f1fBfpxPjZL  (aura: 0x5e9659d151a03a5902e3135c9e361855f6d1caaea6e53a7d8613d7ad410bf507)
-    ChainCfg { name: "Polkadot Bulletin",    ws: "wss://bulletin-rpc.polkadot.io",             ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot Bulletin",    rpcs: &["ws://192.168.250.241:9944", "ws://192.168.250.242:9944"],                         ss58: 0, session_is_sr25519: true  },
     // Kusama
-    ChainCfg { name: "Kusama Asset Hub",     ws: "wss://rpc-asset-hub-kusama.luckyfriday.io",    ss58: 2, session_is_sr25519: true  },
-    ChainCfg { name: "Kusama Bridge Hub",    ws: "wss://rpc-bridge-hub-kusama.luckyfriday.io",   ss58: 2, session_is_sr25519: true  },
-    ChainCfg { name: "Kusama Coretime",      ws: "wss://rpc-coretime-kusama.luckyfriday.io",     ss58: 2, session_is_sr25519: true  },
-    ChainCfg { name: "Kusama People",        ws: "wss://rpc-people-kusama.luckyfriday.io",       ss58: 2, session_is_sr25519: true  },
-    ChainCfg { name: "Kusama Encointer",     ws: "wss://rpc-encointer-kusama.luckyfriday.io",    ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Asset Hub",     rpcs: &["ws://192.168.250.176:9944", "ws://192.168.250.221:9944"], ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Bridge Hub",    rpcs: &["ws://192.168.250.178:9944", "ws://192.168.250.222:9944"], ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Coretime",      rpcs: &["ws://192.168.250.211:9944", "ws://192.168.250.223:9944"], ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama People",        rpcs: &["ws://192.168.250.215:9944", "ws://192.168.250.224:9944"], ss58: 2, session_is_sr25519: true  },
+    ChainCfg { name: "Kusama Encointer",     rpcs: &["ws://192.168.250.218:9944", "ws://192.168.250.225:9944"], ss58: 2, session_is_sr25519: true  },
 ];
 
 // ---------------- knobs ----------------
@@ -97,6 +101,10 @@ const CHUNK_SIZE: usize = 10_000;
 const CONCURRENCY: usize = 32;
 const CHUNK_CONCURRENCY: usize = 20;
 const CALL_TIMEOUT_SECS: u64 = 20;
+// Max time for one block's set of reads on one endpoint before trying the next endpoint
+const ATTEMPT_TIMEOUT_SECS: u64 = 60;
+// Max time to open a connection to one endpoint at startup
+const CONNECT_TIMEOUT_SECS: u64 = 15;
 
 // ---------------- NO-REWARD LIST ----------------
 
@@ -351,6 +359,140 @@ fn save_to_csv(
     Ok(())
 }
 
+// ---------------- RPC pool with failover ----------------
+
+/// One connected endpoint: a subxt client (typed storage) + a raw JSON-RPC client.
+#[derive(Clone)]
+struct Endpoint {
+    url: &'static str,
+    api: OnlineClient<PolkadotConfig>,
+    rpc: Arc<jsonrpsee::ws_client::WsClient>,
+}
+
+/// All endpoints for one chain. Calls go to the preferred endpoint; if a call fails or
+/// times out it is retried on the next one, and that one becomes preferred.
+struct RpcPool {
+    chain_name: &'static str,
+    eps: Vec<Endpoint>,
+    preferred: AtomicUsize,
+}
+
+impl RpcPool {
+    /// Connect to every endpoint that answers. Endpoints on a different chain
+    /// (genesis hash mismatch) are dropped. At least one must connect.
+    async fn connect(chain: &ChainCfg) -> Result<Self> {
+        let mut eps = Vec::new();
+        let mut genesis: Option<H256> = None;
+
+        for &url in chain.rpcs {
+            let attempt = async {
+                let api = OnlineClient::<PolkadotConfig>::from_insecure_url(url)
+                    .await
+                    .with_context(|| format!("connect subxt to {url}"))?;
+                let rpc = Arc::new(
+                    WsClientBuilder::default()
+                        .build(url)
+                        .await
+                        .with_context(|| format!("connect rpc ws to {url}"))?,
+                );
+                let g = block_hash_by_number(&rpc, 0).await?;
+                Ok::<_, anyhow::Error>((Endpoint { url, api, rpc }, g))
+            };
+
+            match tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), attempt).await {
+                Ok(Ok((ep, g))) => {
+                    match genesis {
+                        None => genesis = Some(g),
+                        Some(expected) if expected != g => {
+                            eprintln!("WARN: {url} is on a different chain (genesis {g:?}, expected {expected:?}) - not used");
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    println!("   ✓ connected: {url}");
+                    eps.push(ep);
+                }
+                Ok(Err(e)) => eprintln!("WARN: cannot connect to {url}: {e:#}"),
+                Err(_) => eprintln!("WARN: timeout connecting to {url}"),
+            }
+        }
+
+        if eps.is_empty() {
+            bail!("No RPC endpoint reachable for {} (tried: {})", chain.name, chain.rpcs.join(", "));
+        }
+        Ok(RpcPool { chain_name: chain.name, eps, preferred: AtomicUsize::new(0) })
+    }
+
+    fn urls(&self) -> String {
+        self.eps.iter().map(|e| e.url).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Run `f` on the preferred endpoint; on error/timeout retry on the others.
+    async fn run<T, F, Fut>(&self, what: &str, f: F) -> Result<T>
+    where
+        F: Fn(Endpoint) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let n = self.eps.len();
+        let start = self.preferred.load(AtomicOrdering::Relaxed) % n;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for i in 0..n {
+            let idx = (start + i) % n;
+            let ep = self.eps[idx].clone();
+            let url = ep.url;
+            match tokio::time::timeout(Duration::from_secs(ATTEMPT_TIMEOUT_SECS), f(ep)).await {
+                Ok(Ok(v)) => {
+                    if idx != start
+                        && self.preferred
+                        .compare_exchange(start, idx, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                        .is_ok()
+                    {
+                        eprintln!("  [{}] switched to {} after failure on {}", self.chain_name, url, self.eps[start].url);
+                    }
+                    return Ok(v);
+                }
+                Ok(Err(e)) => last_err = Some(e.context(format!("{what} on {url}"))),
+                Err(_) => last_err = Some(anyhow!("{what} on {url}: timeout after {ATTEMPT_TIMEOUT_SECS}s")),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("{what}: no endpoints")))
+    }
+}
+
+/// Everything read for one block. Built in full before any stats are updated, so a
+/// failed attempt that is retried on another endpoint can never be counted twice.
+struct BlockInfo {
+    owner: Option<[u8; 32]>, // None = author could not be resolved
+    invulnerables: HashSet<[u8; 32]>,
+}
+
+async fn read_block(ep: &Endpoint, n: u32, chain: ChainCfg) -> Result<BlockInfo> {
+    let h = block_hash_by_number(&ep.rpc, n).await?;
+
+    // aura session key (slot % authorities) and the invulnerable set at THIS block
+    let (session_key_opt, invulnerables) = tokio::try_join!(
+        derive_session_key_typed(&ep.api, h, chain),
+        fetch_invulnerables_typed(&ep.api, h, chain),
+    )?;
+
+    // owner via Session::KeyOwner((KeyTypeId("aura"), key_bytes))
+    let owner = match session_key_opt {
+        Some(k) => session_key_owner_account_typed(&ep.api, h, chain, k).await?,
+        None => None,
+    };
+
+    Ok(BlockInfo { owner, invulnerables })
+}
+
+async fn timestamp_at(pool: &RpcPool, n: u32, chain: ChainCfg) -> Result<u64> {
+    pool.run(&format!("timestamp #{n}"), |ep| async move {
+        let h = block_hash_by_number(&ep.rpc, n).await?;
+        Ok::<_, anyhow::Error>(block_timestamp_typed(&ep.api, h, chain).await?.unwrap_or(0))
+    })
+        .await
+}
+
 // ---------------- main ----------------
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -376,25 +518,29 @@ async fn main() -> Result<()> {
     let end_ms = end_dt.timestamp_millis() as u64;
 
     println!(
-        "==> Chain: {}  |  RPC: {}\n==> Window: [{} .. {})  |  Reward cap: ${:.2}",
-        chain.name, chain.ws, start_dt.to_rfc3339(), end_dt.to_rfc3339(), reward_cap_usd(&chain)
+        "==> Chain: {}  |  RPCs: {}\n==> Window: [{} .. {})  |  Reward cap: ${:.2}",
+        chain.name, chain.rpcs.join(", "), start_dt.to_rfc3339(), end_dt.to_rfc3339(), reward_cap_usd(&chain)
     );
 
-    // connections
-    let api = OnlineClient::<PolkadotConfig>::from_insecure_url(chain.ws)
-        .await
-        .with_context(|| format!("connect subxt to {}", chain.ws))?;
-    let rpc = Arc::new(
-        WsClientBuilder::default()
-            .build(chain.ws)
-            .await
-            .with_context(|| format!("connect rpc ws to {}", chain.ws))?,
-    );
+    // connections (all endpoints for this chain; failover between them)
+    println!("==> Connecting…");
+    let pool = Arc::new(RpcPool::connect(&chain).await?);
+    if pool.eps.len() < chain.rpcs.len() {
+        eprintln!("WARN: running with {} of {} endpoints (no failover if it drops)", pool.eps.len(), chain.rpcs.len());
+    }
 
     // latest
-    let latest = api.blocks().at_latest().await?;
-    let latest_num = latest.number();
-    let latest_ts = block_timestamp_typed(&api, latest.hash(), chain).await?.unwrap_or(0);
+    let (latest_num, latest_hash) = pool
+        .run("latest block", |ep| async move {
+            let b = ep.api.blocks().at_latest().await?;
+            Ok::<_, anyhow::Error>((b.number(), b.hash()))
+        })
+        .await?;
+    let latest_ts = pool
+        .run("latest timestamp", |ep| async move {
+            Ok::<_, anyhow::Error>(block_timestamp_typed(&ep.api, latest_hash, chain).await?.unwrap_or(0))
+        })
+        .await?;
     println!("==> Latest: #{} ts={}", latest_num, fmt_ts(latest_ts));
     if latest_ts < start_ms {
         bail!("Latest {} is before window start {}.", fmt_ts(latest_ts), fmt_ts(start_ms));
@@ -402,11 +548,11 @@ async fn main() -> Result<()> {
 
     // bounds via binary search
     println!("==> Locating first block ≥ {} (binary search)…", fmt_ts(start_ms));
-    let first_num = bin_search_first_ge(&api, &rpc, 0, latest_num, start_ms, chain).await?;
+    let first_num = bin_search_first_ge(&pool, 0, latest_num, start_ms, chain).await?;
     println!("   -> first in window: #{}", first_num);
 
     println!("==> Locating last block < {} (binary search)…", fmt_ts(end_ms));
-    let ub = bin_search_first_ge(&api, &rpc, first_num, latest_num, end_ms, chain).await?;
+    let ub = bin_search_first_ge(&pool, first_num, latest_num, end_ms, chain).await?;
     let last_num = ub.saturating_sub(1);
     println!("   -> last in window:  #{}", last_num);
     if last_num < first_num { bail!("Empty window: last({last_num}) < first({first_num})."); }
@@ -460,8 +606,7 @@ async fn main() -> Result<()> {
         chunk_specs
             .into_iter()
             .map(|(c_start, c_end, chunk_pb)| {
-                let api = api.clone();
-                let rpc = rpc.clone();
+                let pool = pool.clone();
                 let stats = stats.clone();
                 let overall_pb = overall_pb.clone();
                 let pb_for_tasks = chunk_pb.clone();
@@ -475,8 +620,7 @@ async fn main() -> Result<()> {
                     let numbers: Vec<u32> = (c_start..=c_end).collect();
 
                     futures::stream::iter(numbers.into_iter().map(move |n| {
-                        let api = api.clone();
-                        let rpc = rpc.clone();
+                        let pool = pool.clone();
                         let stats = stats.clone();
                         let chunk_pb = pb_for_tasks.clone();
                         let overall_pb = overall_pb.clone();
@@ -487,62 +631,51 @@ async fn main() -> Result<()> {
                         let chain = chain;
 
                         async move {
-                            let res: Result<()> = async {
-                                let h = block_hash_by_number(&rpc, n).await?;
-
-                                // 1) derive aura session key (slot % authorities) and read the
-                                //    invulnerable set as it was at THIS block (in parallel)
-                                let (session_key_opt, invulnerables) = tokio::try_join!(
-                                    derive_session_key_typed(&api, h, chain),
-                                    fetch_invulnerables_typed(&api, h, chain),
-                                )?;
-
-                                // record every invulnerable seen, with first/last block
-                                {
-                                    let mut seen = inv_seen.lock().await;
-                                    for raw in invulnerables.iter() {
-                                        let e = seen.entry(*raw).or_insert((n, n));
-                                        if n < e.0 { e.0 = n; }
-                                        if n > e.1 { e.1 = n; }
+                            // All reads for this block, with failover between endpoints.
+                            // Stats are only touched after a fully successful read.
+                            match pool
+                                .run(&format!("block #{n}"), |ep| async move { read_block(&ep, n, chain).await })
+                                .await
+                            {
+                                Ok(info) => {
+                                    // record every invulnerable seen, with first/last block
+                                    {
+                                        let mut seen = inv_seen.lock().await;
+                                        for raw in info.invulnerables.iter() {
+                                            let e = seen.entry(*raw).or_insert((n, n));
+                                            if n < e.0 { e.0 = n; }
+                                            if n > e.1 { e.1 = n; }
+                                        }
                                     }
-                                }
 
-                                // 2) resolve owner via Session::KeyOwner((KeyTypeId("aura"), key_bytes))
-                                if let Some(sess_key) = session_key_opt {
-                                    if let Some(owner_raw) = session_key_owner_account_typed(&api, h, chain, sess_key).await? {
-                                        // 3) only count blocks authored by a collator that was
-                                        //    invulnerable at this block
-                                        if invulnerables.contains(&owner_raw) {
+                                    match info.owner {
+                                        // only count blocks authored by a collator that was
+                                        // invulnerable at this block
+                                        Some(owner_raw) if info.invulnerables.contains(&owner_raw) => {
                                             let mut sm = stats.lock().await;
                                             *sm.entry(owner_raw).or_insert(0) += 1;
-                                        } else {
+                                        }
+                                        Some(_) => {
                                             let mut sk = skipped_non_invulnerable.lock().await;
                                             *sk += 1;
                                         }
-                                    } else {
-                                        let mut u = unknowns.lock().await;
-                                        *u += 1;
-                                        let mut sm = stats.lock().await;
-                                        *sm.entry([0u8; 32]).or_insert(0) += 1;
+                                        None => {
+                                            let mut u = unknowns.lock().await;
+                                            *u += 1;
+                                            let mut sm = stats.lock().await;
+                                            *sm.entry([0u8; 32]).or_insert(0) += 1;
+                                        }
                                     }
-                                } else {
-                                    let mut u = unknowns.lock().await;
-                                    *u += 1;
-                                    let mut sm = stats.lock().await;
-                                    *sm.entry([0u8; 32]).or_insert(0) += 1;
                                 }
-
-                                // progress
-                                chunk_pb.inc(1);
-                                overall_pb.inc(1);
-                                Ok(())
-                            }.await;
-
-                            if let Err(e) = res {
-                                let mut be = block_errors.lock().await;
-                                *be += 1;
-                                eprintln!("  [block #{n} error] {e:#}");
+                                Err(e) => {
+                                    let mut be = block_errors.lock().await;
+                                    *be += 1;
+                                    eprintln!("  [block #{n} error - all endpoints failed] {e:#}");
+                                }
                             }
+
+                            chunk_pb.inc(1);
+                            overall_pb.inc(1);
                             Ok::<(), anyhow::Error>(())
                         }
                     }))
@@ -643,7 +776,7 @@ async fn main() -> Result<()> {
 
     println!("\n================ SUMMARY (full scan) ================");
     println!("Chain:      {}", chain.name);
-    println!("Chain RPC:  {}", chain.ws);
+    println!("Chain RPCs: {}", pool.urls());
     println!("Window:     [{} .. {})", start_dt.to_rfc3339(), end_dt.to_rfc3339());
     println!("Blocks counted (invulnerables + unresolved): {}", total_scanned);
     println!("Blocks skipped (non-invulnerable authors):   {}", skipped_non_invulnerable);
@@ -817,15 +950,14 @@ async fn block_timestamp_typed(api: &OnlineClient<PolkadotConfig>, at: H256, cha
 }
 
 async fn bin_search_first_ge(
-    api: &OnlineClient<PolkadotConfig>,
-    rpc: &Arc<jsonrpsee::ws_client::WsClient>,
+    pool: &RpcPool,
     mut lo: u32,
     mut hi: u32,
     target_ms: u64,
     chain: ChainCfg,
 ) -> Result<u32> {
-    let lo_ts = block_timestamp_typed(api, block_hash_by_number(rpc, lo).await?, chain).await?.unwrap_or(0);
-    let hi_ts = block_timestamp_typed(api, block_hash_by_number(rpc, hi).await?, chain).await?.unwrap_or(0);
+    let lo_ts = timestamp_at(pool, lo, chain).await?;
+    let hi_ts = timestamp_at(pool, hi, chain).await?;
 
     if hi_ts < target_ms {
         bail!("bin_search_first_ge: hi(#{} ts={}) < target {}", hi, fmt_ts(hi_ts), fmt_ts(target_ms));
@@ -834,8 +966,7 @@ async fn bin_search_first_ge(
 
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        let mid_h = block_hash_by_number(rpc, mid).await?;
-        let mid_ts = block_timestamp_typed(api, mid_h, chain).await?.unwrap_or(0);
+        let mid_ts = timestamp_at(pool, mid, chain).await?;
         if mid_ts >= target_ms { hi = mid; } else { lo = mid; }
     }
     Ok(hi)
