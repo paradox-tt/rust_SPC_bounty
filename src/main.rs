@@ -68,7 +68,7 @@ const CHAINS: &[ChainCfg] = &[
     //   Faraday Nodes  -> 155wHcqJ3fcfgtHsjqKHwNEU24pzRkkmZK865xxHeFTXMU8T  (aura: 0x4e91cfd5145fea6ebd1d1a441b33797e9c19918fa017291c73e56d2590566778)
     //   yaron          -> 1sXuddoUew7f9F9XTVyns8KjCRRLvpvvUsZUyxZhqtH4RZn  (aura: 0x80d6667f725e501088c081ff924dbe1aa50c67618b0984cb996c3d5fa5500f0f)
     //   DPSTK|dapestake-> 1A1WrKowzJD4yQQcETugEV5UWoNo1o7ujuA3f1fBfpxPjZL  (aura: 0x5e9659d151a03a5902e3135c9e361855f6d1caaea6e53a7d8613d7ad410bf507)
-    ChainCfg { name: "Polkadot Bulletin",    ws: "wss://rpc-bulletin.luckyfriday.io",             ss58: 0, session_is_sr25519: true  },
+    ChainCfg { name: "Polkadot Bulletin",    ws: "wss://bulletin-rpc.polkadot.io",             ss58: 0, session_is_sr25519: true  },
     // Kusama
     ChainCfg { name: "Kusama Asset Hub",     ws: "wss://rpc-asset-hub-kusama.luckyfriday.io",    ss58: 2, session_is_sr25519: true  },
     ChainCfg { name: "Kusama Bridge Hub",    ws: "wss://rpc-bridge-hub-kusama.luckyfriday.io",   ss58: 2, session_is_sr25519: true  },
